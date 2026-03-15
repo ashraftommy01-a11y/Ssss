@@ -1,0 +1,2899 @@
+#!/usr/bin/env python3
+"""Neural-Symbolic NLP Chatbot — Single File Version (FIXED)"""
+import re, json, os, pickle, random, hashlib, sys, threading, queue
+from collections import defaultdict, Counter
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+
+# FIX 2: Move tkinter imports to the TOP (before GUI classes are defined)
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, filedialog, messagebox
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
+
+os.makedirs('data', exist_ok=True)
+os.makedirs('knowledge', exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEMANTIC RESOURCES — synonym expansion + question normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+SYNONYMS = {
+    'created':   ['invented','made','built','developed','designed','produced','authored','wrote'],
+    'invented':  ['created','made','built','developed','discovered'],
+    'made':      ['created','built','produced','manufactured'],
+    'built':     ['created','made','constructed','developed'],
+    'developed': ['created','built','invented','designed'],
+    'wrote':     ['authored','created','composed','published'],
+    'discovered':['found','identified','invented','uncovered'],
+    'founded':   ['created','established','started','built'],
+    'fast':      ['speed','quick','rapid','swift'],
+    'speed':     ['fast','velocity','rate','pace'],
+    'quick':     ['fast','rapid','swift'],
+    'located':   ['situated','found','positioned','placed'],
+    'situated':  ['located','found','positioned'],
+    'big':       ['large','huge','enormous','giant'],
+    'large':     ['big','huge','enormous'],
+    'small':     ['tiny','little','miniature'],
+    'know':      ['understand','comprehend','aware'],
+    'understand':['know','comprehend','grasp'],
+    'flows':     ['runs','passes','goes','travels'],
+    'grows':     ['reaches','extends','becomes','develops'],
+    'lives':     ['stays','resides','dwells'],
+    'works':     ['operates','functions','runs'],
+}
+
+QUESTION_SYNONYMS = {
+    'how fast':  'what speed',
+    'how many':  'what number',
+    'how much':  'what amount',
+    'how old':   'what age',
+    'how long':  'what duration',
+    'how far':   'what distance',
+    'how tall':  'what height',
+    'how big':   'what size',
+    'how small': 'what size',
+    'how heavy': 'what weight',
+}
+
+def expand_synonyms(words: set) -> set:
+    expanded = set(words)
+    for word in list(words):
+        if word in SYNONYMS:
+            expanded.update(SYNONYMS[word])
+        for key, syns in SYNONYMS.items():
+            if word in syns:
+                expanded.add(key)
+                expanded.update(syns)
+    return expanded
+
+def normalize_question(text: str) -> str:
+    text = text.lower().strip()
+    contractions = {
+        "what's":"what is","who's":"who is","where's":"where is",
+        "when's":"when is","how's":"how is","why's":"why is",
+        "it's":"it is","i'm":"i am","don't":"do not",
+        "doesn't":"does not","didn't":"did not","can't":"cannot",
+        "won't":"will not","isn't":"is not","aren't":"are not",
+        "wasn't":"was not","weren't":"were not","that's":"that is",
+    }
+    for c, e in contractions.items():
+        text = text.replace(c, e)
+    prefixes = [
+        r'^tell me\s+',r'^can you tell me\s+',r'^could you tell me\s+',
+        r'^please tell me\s+',r'^do you know\s+',r'^can you explain\s+',
+    ]
+    for p in prefixes:
+        text = re.sub(p, '', text)
+    for pattern, replacement in QUESTION_SYNONYMS.items():
+        if pattern in text:
+            text = text.replace(pattern, replacement)
+    # Reorder embedded questions: "what the sky is" → "what is the sky"
+    text = re.sub(r'\bwhat\s+(\w[\w\s]{1,25}?)\s+is\b', r'what is \1', text)
+    text = re.sub(r'\bwho\s+(\w[\w\s]{1,25}?)\s+is\b',  r'who is \1',  text)
+    text = re.sub(r'\bwhere\s+(\w[\w\s]{1,25}?)\s+is\b',r'where is \1',text)
+    return text.strip()
+
+
+class SentenceParser:
+    """
+    Parses any English sentence into structured facts:
+    subject, verb, object, adjectives, adverbs, location, time, manner.
+    Enables the bot to answer questions about sentences it has never seen before.
+    """
+
+    # Word lists for POS tagging
+    AUXILIARIES = {'am','is','are','was','were','be','been','being',
+                   'do','does','did','have','has','had',
+                   'will','would','shall','should','can','could','may','might','must'}
+    PREPOSITIONS = {'at','in','on','to','for','with','by','from','of','into',
+                    'through','during','before','after','above','below','between',
+                    'under','along','around','near','toward','towards','onto',
+                    'off','over','up','down','out','about','against','across',
+                    'behind','beside','beyond','inside','outside','upon','within'}
+    QUESTION_WORDS = {'who','what','where','when','why','how','which','whose','whom'}
+    DETERMINERS   = {'the','a','an','this','that','these','those','my','your',
+                     'his','her','its','our','their','some','any','each','every',
+                     'all','both','few','more','most','other','another','such','no'}
+    CONJUNCTIONS  = {'and','but','or','nor','so','yet','for','although','because',
+                     'since','while','if','unless','until','though','whether'}
+    PRONOUNS      = {'i','me','my','myself','you','your','yourself','he','him',
+                     'his','himself','she','her','hers','herself','it','its',
+                     'itself','we','us','our','ourselves','they','them','their',
+                     'themselves','who','whom','whose','which','that'}
+
+    def __init__(self):
+        # Last parsed sentence context for pronoun resolution
+        self.last_subject: Optional[str] = None
+        self.last_sentence: Optional[str] = None
+        self.context_facts: List[Dict] = []   # all facts from current context
+
+    # ── Tokenisation ──────────────────────────────────────────────────────
+    def tokenize(self, text: str) -> List[str]:
+        text = re.sub(r'([.!?,;:"])', r' \1 ', text)
+        return [t for t in text.split() if t.strip()]
+
+    def tag(self, tokens: List[str]) -> List[Tuple[str, str]]:
+        """Simple rule-based POS tagger — returns (word, tag) pairs."""
+        tagged = []
+        for i, tok in enumerate(tokens):
+            tl = tok.lower().rstrip('.,!?')
+            if tl in self.AUXILIARIES:          tag = 'AUX'
+            elif tl in self.PREPOSITIONS:       tag = 'PREP'
+            elif tl in self.DETERMINERS:        tag = 'DET'
+            elif tl in self.CONJUNCTIONS:       tag = 'CONJ'
+            elif tl in self.PRONOUNS:           tag = 'PRON'
+            elif tl in self.QUESTION_WORDS:     tag = 'WH'
+            elif tl.endswith('ly'):             tag = 'ADV'
+            elif tl.endswith('ing'):            tag = 'VERB'
+            elif tl.endswith('ed'):             tag = 'VERB'
+            elif tl.endswith('tion') or tl.endswith('ness') or tl.endswith('ment'): tag = 'NOUN'
+            elif re.match(r'^\d+(\.\d+)?$', tl):  tag = 'NUM'
+            elif tok[0].isupper() and i > 0:    tag = 'PROP'   # proper noun
+            else:
+                # Check word position heuristics
+                prev_tag = tagged[i-1][1] if i > 0 else ''
+                if prev_tag in ('DET','ADJ','NUM'):  tag = 'NOUN'
+                elif prev_tag == 'AUX':              tag = 'VERB'
+                elif tl.endswith('s') and prev_tag in ('NOUN','PROP'): tag = 'VERB'
+                else:                                tag = 'NOUN'  # default
+            tagged.append((tok.lower().rstrip('.,!?'), tag))
+        return tagged
+
+    # ── Chunk extraction ─────────────────────────────────────────────────
+    def get_noun_phrase(self, tagged: List[Tuple[str,str]], start: int) -> Tuple[str, int]:
+        """Extract noun phrase starting at index, return (phrase, end_index)."""
+        parts = []
+        i = start
+        while i < len(tagged):
+            word, tag = tagged[i]
+            if tag in ('DET','ADJ','PROP','NOUN','NUM','PRON'):
+                parts.append(word)
+                i += 1
+            elif tag == 'NOUN' or tag == 'PROP':
+                parts.append(word)
+                i += 1
+                break
+            else:
+                break
+        return ' '.join(parts), i
+
+    def get_adj_phrase(self, tagged: List[Tuple[str,str]], start: int) -> Tuple[str, int]:
+        """Extract adjective phrase starting at index."""
+        parts = []
+        i = start
+        while i < len(tagged):
+            word, tag = tagged[i]
+            if tag in ('ADJ','ADV','NUM'):
+                parts.append(word)
+                i += 1
+            else:
+                break
+        return ' '.join(parts) if parts else '', i
+
+    # ── Main parse ────────────────────────────────────────────────────────
+    def parse(self, sentence: str) -> Dict:
+        """
+        Parse a sentence into a structured fact dictionary:
+        {subject, verb, object, adjectives, adverbs, location, time, manner, raw}
+        """
+        tl   = sentence.strip().rstrip('.!?')
+        tokens = self.tokenize(tl)
+        tagged = self.tag(tokens)
+
+        result = {
+            'raw':        tl,
+            'subject':    '',
+            'verb':       '',
+            'object':     '',
+            'adjectives': [],   # adjectives describing the subject
+            'adverbs':    [],   # adverbs modifying the verb
+            'location':   '',
+            'time':       '',
+            'manner':     '',
+            'quantity':   '',
+            'negated':    False,
+        }
+
+        i = 0
+        n = len(tagged)
+
+        # ── Subject ────────────────────────────────────────────────────
+        # Skip leading determiners, collect noun phrase
+        while i < n and tagged[i][1] == 'DET':
+            i += 1
+        # Collect adjectives before subject noun
+        while i < n and tagged[i][1] in ('ADJ','ADV','NUM'):
+            result['adjectives'].append(tagged[i][0])
+            i += 1
+        # Collect subject noun phrase
+        subj_parts = []
+        while i < n and tagged[i][1] in ('NOUN','PROP','PRON','NUM'):
+            subj_parts.append(tagged[i][0])
+            i += 1
+        result['subject'] = ' '.join(subj_parts)
+
+        # ── Verb phrase ────────────────────────────────────────────────
+        # Skip auxiliaries, collect main verb
+        while i < n and tagged[i][1] == 'AUX':
+            if tagged[i][0] in ('not',"n't",'never'):
+                result['negated'] = True
+            i += 1
+        if i < n and tagged[i][1] in ('VERB','AUX'):
+            result['verb'] = tagged[i][0]
+            i += 1
+        # Collect adverbs right after verb
+        while i < n and tagged[i][1] == 'ADV':
+            result['adverbs'].append(tagged[i][0])
+            i += 1
+
+        # ── Negation check ─────────────────────────────────────────────
+        for word, tag in tagged:
+            if word in ('not', "n't", 'never', 'no'):
+                result['negated'] = True
+
+        # ── Object / complement ────────────────────────────────────────
+        obj_parts = []
+        while i < n and tagged[i][1] not in ('PREP','CONJ') and tagged[i][0] not in self.PREPOSITIONS:
+            word, tag = tagged[i]
+            if tag in ('DET','ADJ','NOUN','PROP','NUM','PRON','ADV'):
+                obj_parts.append(word)
+            i += 1
+        result['object'] = ' '.join(obj_parts)
+
+        # ── Prepositional phrases ──────────────────────────────────────
+        while i < n:
+            word, tag = tagged[i]
+            if tag == 'CONJ' or word in self.CONJUNCTIONS:
+                i += 1
+                # After 'and', may be another VP — collect as extra object
+                continue
+            if tag == 'PREP' or word in self.PREPOSITIONS:
+                prep = word
+                i += 1
+                # Collect the NP after the preposition
+                pp_parts = []
+                while i < n and tagged[i][1] not in ('PREP','CONJ') and tagged[i][0] not in self.PREPOSITIONS:
+                    pp_parts.append(tagged[i][0])
+                    i += 1
+                pp = ' '.join(pp_parts)
+                # Classify by preposition type
+                if prep == 'of':
+                    # "of" phrase extends the object (e.g. "theory of relativity")
+                    if result['object']:
+                        result['object'] = result['object'] + ' of ' + pp
+                    else:
+                        result['object'] = pp
+                elif prep in ('at','in','on','near','beside','behind','inside','outside',
+                            'above','below','under','over','around','across','along',
+                            'between','beyond','through','within','toward','towards'):
+                    if not result['location']:
+                        result['location'] = f"{prep} {pp}"
+                elif prep in ('before','after','during','until','when','while','by'):
+                    if not result['time']:
+                        result['time'] = f"{prep} {pp}"
+                elif prep == 'to':
+                    if not result['location']:
+                        result['location'] = f"to {pp}"
+                else:
+                    if not result['object']:
+                        result['object'] = pp
+            else:
+                i += 1
+
+        # ── Quantity extraction ────────────────────────────────────────
+        qty_m = re.search(r'\b(\d+[\d,.]*\s*(?:meters?|km|kilograms?|kg|grams?|degrees?|percent|%|years?|days?|hours?|minutes?|seconds?|dollars?|pounds?|miles?|feet|inches?|cm|mm|liters?|tons?)?)\b', tl, re.I)
+        if qty_m:
+            result['quantity'] = qty_m.group(1).strip()
+
+        # Update last subject for pronoun resolution
+        if result['subject'] and result['subject'] not in ('it','he','she','they','we','i','you'):
+            self.last_subject = result['subject']
+
+        return result
+
+    # ── Question answering ────────────────────────────────────────────
+    def _extract_inline_adj(self, phrase: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (adjective, noun) from phrases like 'the red house', 'the quiet street'."""
+        m = re.match(r'^(?:the|a|an)?\s*(\w+)\s+(\w+)$', phrase.strip(), re.I)
+        if m:
+            return m.group(1).lower(), m.group(2).lower()
+        return None, None
+
+    def answer(self, question: str, facts: List[Dict]) -> Optional[str]:
+        """
+        Given a question and a list of parsed facts,
+        find and return the best answer.
+
+        FIX 3: Improved logic to not return None prematurely
+        """
+        ql  = question.lower().strip().rstrip('?')
+        qtoks = self.tokenize(ql)
+        qtype = qtoks[0] if qtoks else ''
+
+        # Pronoun resolution in question
+        resolved_facts = self._resolve_pronouns(facts)
+
+        # First pass: find the most relevant fact
+        best_fact = None
+        best_score = 0
+
+        for fact in resolved_facts:
+            subj  = fact.get('subject','')
+            verb  = fact.get('verb','')
+            obj   = fact.get('object','')
+            loc   = fact.get('location','')
+            adjs  = fact.get('adjectives',[])
+            advs  = fact.get('adverbs',[])
+            qty   = fact.get('quantity','')
+            neg   = fact.get('negated', False)
+            raw   = fact.get('raw','')
+
+            # Calculate relevance score
+            all_fact_text = ' '.join(filter(None, [raw, subj, verb, obj, loc,
+                                                    fact.get('time',''), ' '.join(adjs), ' '.join(advs)]))
+            fact_words = set(re.findall(r'\b\w{3,}\b', all_fact_text.lower()))
+            q_content  = set(re.findall(r'\b\w{3,}\b', ql)) - self.QUESTION_WORDS - self.AUXILIARIES
+
+            # FIX 3: More lenient matching - check if ANY content word matches
+            overlap = fact_words & q_content
+
+            # Score based on overlap and subject match
+            score = len(overlap)
+            if self._subject_matches(ql, subj):
+                score += 3  # Bonus for subject match
+
+            if score > best_score:
+                best_score = score
+                best_fact = fact
+
+        # If no relevant fact found, return None
+        if best_fact is None or best_score == 0:
+            return None
+
+        # Use the best matching fact to generate answer
+        fact = best_fact
+        subj  = fact.get('subject','')
+        verb  = fact.get('verb','')
+        obj   = fact.get('object','')
+        loc   = fact.get('location','')
+        adjs  = fact.get('adjectives',[])
+        advs  = fact.get('adverbs',[])
+        qty   = fact.get('quantity','')
+        neg   = fact.get('negated', False)
+        raw   = fact.get('raw','')
+
+        # WHO questions
+        if qtype == 'who':
+            if subj and verb in raw:
+                return f"{subj.title()} {verb}{(' ' + obj) if obj else ''}."
+
+        # WHAT questions
+        elif qtype == 'what':
+            if 'color' in ql or 'colour' in ql:
+                # Check direct adjectives first
+                colors = ('red','blue','green','black','white','yellow',
+                          'brown','grey','gray','orange','purple','pink','gold','silver')
+                for adj in adjs:
+                    if adj in colors:
+                        return f"The {subj} is {adj}."
+                # Check location NP for inline adjectives e.g. "to the red house"
+                q_noun = re.search(r'\b(\w+)\s*$', ql.strip())
+                q_noun_str = q_noun.group(1) if q_noun else ''
+                for phrase in [loc, obj, raw]:
+                    if not phrase:
+                        continue
+                    phrase_l = phrase.lower()
+                    if q_noun_str and q_noun_str in phrase_l:
+                        # Find color word immediately before the noun
+                        m_color = re.search(r'\b(' + '|'.join(colors) + r')\s+' + re.escape(q_noun_str), phrase_l)
+                        if m_color:
+                            return f"The {q_noun_str} is {m_color.group(1)}."
+                        # Just find any color word in the phrase
+                        for word in phrase_l.split():
+                            if word in colors:
+                                return f"The {q_noun_str} is {word}."
+                if obj and any(c in obj for c in colors):
+                    return f"It is {obj}."
+            elif 'kind' in ql or 'type' in ql or 'sort' in ql:
+                # Check location and object for inline adjectives
+                q_noun = re.search(r'\b(\w+)\s*$', ql.strip())
+                q_noun_str = q_noun.group(1) if q_noun else ''
+                for phrase in [raw, loc, obj]:
+                    if phrase and q_noun_str and q_noun_str in phrase.lower():
+                        words = re.findall(r"\b\w+\b", phrase.lower())
+                        idx = next((i for i, w in enumerate(words) if w == q_noun_str), -1)
+                        if idx > 0 and words[idx-1] not in self.DETERMINERS and words[idx-1] not in self.PREPOSITIONS:
+                            return f"The {q_noun_str} is {words[idx-1]}."
+                if adjs:
+                    return f"The {subj} is {' '.join(adjs)}."
+            elif 'did' in ql or 'do' in ql or 'does' in ql:
+                if verb and obj:
+                    return f"{subj.title()} {verb} {obj}{(' ' + loc) if loc else ''}."
+                elif verb:
+                    return f"{subj.title()} {verb}."
+            else:
+                # "What is X?" → only answer if subject actually matches the question
+                q_target = re.search(r'what\s+(?:is|was|are|were)\s+(?:a\s+|an\s+|the\s+)?(.+)', ql)
+                q_target_str = q_target.group(1).strip() if q_target else ''
+                subj_matches = (not q_target_str or
+                                any(w in subj for w in q_target_str.split() if len(w) > 2))
+                if subj_matches:
+                    if adjs and obj:
+                        return f"{subj.title()} is {' '.join(adjs)} {obj}."
+                    elif obj:
+                        return f"{subj.title()} is {obj}."
+                    elif adjs:
+                        return f"{subj.title()} is {' '.join(adjs)}."
+
+        # WHERE questions
+        elif qtype == 'where':
+            if loc:
+                subj_words = [w for w in subj.split() if len(w) > 2]
+                q_words_set = set(re.findall(r'\b\w{3,}\b', ql))
+                # Match if any subject word appears in question OR pronoun used
+                subj_in_q  = bool(set(subj_words) & q_words_set)
+                # Also match via synonym expansion
+                subj_expanded = expand_synonyms(set(subj_words))
+                q_expanded    = expand_synonyms(q_words_set)
+                syn_match  = bool(subj_expanded & q_expanded)
+                pronoun_q  = any(p in ql for p in ('he','she','it','they','him','her','them'))
+                if subj_in_q or syn_match or pronoun_q:
+                    return f"{subj.title()} {verb} {loc}." if verb else f"{subj.title()} is {loc}."
+
+        # WHEN / WHAT TIME questions
+        elif qtype == 'when' or ('what time' in ql):
+            time_val = fact.get('time','')
+            if time_val:
+                return f"{subj.title()} {verb} {time_val}."
+            if qty and any(w in ql for w in ('when','time','day','date')):
+                return f"{subj.title()} {verb} {qty}."
+
+        # HOW questions
+        elif qtype == 'how':
+            if 'how did' in ql or 'how does' in ql or 'how do' in ql:
+                if advs:
+                    return f"{subj.title()} {verb} {' '.join(advs)}."
+                elif obj:
+                    return f"{subj.title()} {verb} {obj}."
+            elif any(w in ql for w in ('how much','how many','how long','how big',
+                                        'how tall','how far','how old','how fast','how heavy')):
+                if qty:
+                    return f"{subj.title()} {verb or 'is'} {qty}."
+                # Also scan ALL facts for quantity (even compound parts with no subject)
+                for f2 in facts:
+                    if f2.get('quantity'):
+                        if self._subject_matches(ql, f2.get('subject','')) or not f2.get('subject'):
+                            subj2 = f2.get('subject','') or (subj if subj else 'It')
+                            return f"{subj2.title()} {f2.get('verb','can grow')} {f2['quantity']}."
+                if obj and any(c.isdigit() for c in obj):
+                    return f"{subj.title()} is {obj}."
+
+        # YES/NO questions
+        elif qtype in ('is','are','was','were','did','does','do','has','have','can','could','will','would'):
+            neg_in_q = 'not' in ql or "n't" in ql
+            if adjs:
+                for adj in adjs:
+                    if adj in ql:
+                        answer = 'Yes' if not neg else 'No'
+                        return f"{answer}, the {subj} is {' '.join(adjs)}."
+            if obj and any(w in ql for w in obj.split()):
+                answer = 'Yes' if not neg else 'No'
+                return f"{answer}, {subj} {verb} {obj}."
+            if loc and any(w in ql for w in loc.split()):
+                return f"Yes, {subj} {verb} {loc}."
+            # Generic yes/no based on fact existence
+            if best_score > 0:
+                return f"Yes — {raw}."
+
+        return None   # no answer found
+
+    def _subject_matches(self, question: str, subject: str) -> bool:
+        """Check if question refers to the subject (including pronouns)."""
+        if not subject:
+            return False
+        subj_words = set(subject.lower().split())
+        q_words    = set(question.lower().split())
+        if subj_words & q_words:
+            return True
+        pronouns = {'he','she','it','they','him','her','them','his','its','their'}
+        if q_words & pronouns:
+            return True
+        return False
+
+    def _resolve_pronouns(self, facts: List[Dict]) -> List[Dict]:
+        """Replace pronoun subjects with the last known named subject."""
+        resolved = []
+        last_named = None
+        for fact in facts:
+            f = dict(fact)
+            subj = f.get('subject','').lower()
+            if subj and subj not in ('it','he','she','they','we','i','you','him','her','them'):
+                last_named = f['subject']
+            elif subj in ('he','she','it','they') and last_named:
+                f['subject'] = last_named
+            resolved.append(f)
+        return resolved
+
+    def extract_all_facts(self, text: str) -> List[Dict]:
+        """
+        Split text into sentences and parse each one.
+        For compound sentences, inherit subject from first clause.
+        Returns list of parsed fact dicts.
+        """
+        sentences = re.split(r'(?<=[.!?])\s+|(?<=\.)\n', text)
+        facts = []
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) < 5:
+                continue
+            # Handle compound sentences joined by 'and'
+            parts = re.split(r'\s+and\s+(?=[a-z])', sent, flags=re.I)
+            last_subject = ''
+            for part in parts:
+                parsed = self.parse(part)
+                # Inherit subject from previous clause if missing
+                if not parsed['subject'] and last_subject:
+                    parsed['subject'] = last_subject
+                if parsed['subject']:
+                    last_subject = parsed['subject']
+                if parsed['subject'] or parsed['verb']:
+                    facts.append(parsed)
+        return facts
+
+
+class SemanticNetwork:
+    """Neural-symbolic knowledge graph for reasoning"""
+    def __init__(self):
+        self.concepts = {}
+        self.relations = defaultdict(list)
+        self.weights = defaultdict(float)
+
+    def add_concept(self, concept: str, attributes: dict):
+        self.concepts[concept] = attributes
+
+    def relate(self, c1: str, relation: str, c2: str, weight: float = 1.0):
+        self.relations[(c1, relation)].append(c2)
+        self.weights[(c1, relation, c2)] = weight
+
+    def infer(self, concept: str, depth: int = 2) -> Dict:
+        """Spreading activation inference using BFS"""
+        results = {}
+        visited = set()
+        queue = [(concept, 1.0, 0)]
+
+        while queue:
+            current, activation, level = queue.pop(0)
+            if current in visited or level > depth:
+                continue
+            visited.add(current)
+            results[current] = activation
+
+            for (c, rel), targets in self.relations.items():
+                if c == current:
+                    for target in targets:
+                        weight = self.weights[(c, rel, target)]
+                        new_activation = activation * weight * 0.8
+                        if new_activation > 0.1:
+                            queue.append((target, new_activation, level + 1))
+        return results
+
+class GrammarEngine:
+    """Probabilistic Context-Free Grammar with learning"""
+    def __init__(self):
+        self.rules = defaultdict(list)
+        self.probabilities = defaultdict(lambda: defaultdict(float))
+        self.lexicon = defaultdict(set)
+        self.syntactic_patterns = []
+
+    def add_rule(self, lhs: str, rhs: List[str], prob: float = 1.0):
+        self.rules[lhs].append(rhs)
+        self.probabilities[lhs][tuple(rhs)] = prob
+
+    def parse(self, tokens: List[str]) -> List[Dict]:
+        """CYK-style parsing with probabilities - pure Python"""
+        n = len(tokens)
+        if n == 0:
+            return []
+
+        # Chart parsing using list of dictionaries
+        chart = [[{} for _ in range(n)] for _ in range(n)]
+
+        # Initialize with lexical items
+        for i, token in enumerate(tokens):
+            for pos in self.lexicon.get(token, {'NN'}):
+                if pos not in chart[i][i]:
+                    chart[i][i][pos] = []
+                chart[i][i][pos].append({'token': token, 'prob': 1.0})
+
+        # Fill chart
+        for length in range(2, n + 1):
+            for i in range(n - length + 1):
+                j = i + length - 1
+                for k in range(i, j):
+                    for lhs, rhs_list in self.rules.items():
+                        for rhs in rhs_list:
+                            if len(rhs) == 2:
+                                left_nodes = chart[i][k].get(rhs[0], [])
+                                right_nodes = chart[k+1][j].get(rhs[1], [])
+                                for left in left_nodes:
+                                    for right in right_nodes:
+                                        prob = (left['prob'] * right['prob'] * 
+                                               self.probabilities[lhs][tuple(rhs)])
+                                        if lhs not in chart[i][j]:
+                                            chart[i][j][lhs] = []
+                                        chart[i][j][lhs].append({
+                                            'left': left, 'right': right,
+                                            'prob': prob, 'split': k
+                                        })
+
+        return chart[0][n-1].get('S', [])
+
+    def learn_pattern(self, sentence: str, structure: str):
+        """Learn new syntactic patterns from examples"""
+        self.syntactic_patterns.append({
+            'sentence': sentence,
+            'structure': structure,
+            'timestamp': datetime.now()
+        })
+
+
+class IntentClassifier:
+    """Multi-level intent recognition with confidence scoring"""
+    def __init__(self):
+        self.intents = {
+            'question': ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'is', 'are', 'can', 'do', 'does'],
+            'command': ['make', 'create', 'build', 'write', 'generate', 'summarize', 'explain', 'tell', 'rephrase', 'rewrite', 'summary'],
+            'greeting': ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening'],
+            'farewell': ['bye', 'goodbye', 'see you', 'take care'],
+            'gratitude': ['thank', 'thanks', 'appreciate'],
+            'learning': ['learn', 'remember', 'save', 'store', 'note'],
+            'meta': ['update', 'change', 'modify', 'algorithm', 'feature', 'improve', 'add intent', 'new intent', 'when i ask', 'when i say', 'learn pattern'],
+        }
+        self.custom_intents = {}
+        self.confidence_threshold = 0.6
+
+    def classify(self, text: str) -> Tuple[str, float]:
+        text_lower = text.lower()
+        tokens = set(re.findall(r'\b\w+\b', text_lower))
+        scores = {}
+
+        # Question words at start of sentence are strong signals
+        question_starters = ['what', 'how', 'why', 'when', 'where', 'who', 'which']
+        starts_with_question = any(text_lower.strip().startswith(w) for w in question_starters)
+
+        # Check all intent categories
+        all_intents = {**self.intents, **self.custom_intents}
+
+        for intent, keywords in all_intents.items():
+            score = 0
+            for keyword in keywords:
+                # Use whole-word matching to avoid substring false positives
+                if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower):
+                    score += 1
+                    # Boost for exact phrase matches
+                    if keyword == text_lower.strip():
+                        score += 2
+            if score > 0:
+                scores[intent] = score / len(keywords)
+
+        # Boost question intent when sentence starts with a question word
+        if starts_with_question:
+            scores['question'] = scores.get('question', 0) + 0.5
+
+        if not scores:
+            return ('statement', 0.3)
+
+        best_intent = max(scores, key=scores.get)
+        confidence = min(scores[best_intent], 1.0)
+
+        # If best intent is question but no question word present and confidence is very low, treat as statement
+        if best_intent == 'question' and not starts_with_question and confidence < 0.15:
+            return ('statement', 0.3)
+
+        return (best_intent, confidence)
+
+    def add_intent(self, name: str, keywords: List[str]):
+        self.custom_intents[name] = keywords
+
+class TextSummarizer:
+    """Extractive and abstractive summarization - pure Python"""
+    def __init__(self):
+        self.stopwords = set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                             'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                             'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+                             'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in',
+                             'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into',
+                             'through', 'during', 'before', 'after', 'above', 'below',
+                             'between', 'under', 'and', 'but', 'or', 'yet', 'so'])
+
+    def summarize(self, text: str, ratio: float = 0.3) -> str:
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+
+        if len(sentences) <= 3:
+            return text
+
+        # Score sentences using pure Python
+        word_freq = Counter()
+        for sent in sentences:
+            words = self._tokenize(sent.lower())
+            for word in words:
+                if word not in self.stopwords:
+                    word_freq[word] += 1
+
+        scores = []
+        for sent in sentences:
+            words = self._tokenize(sent.lower())
+            score = sum(word_freq[w] for w in words if w not in self.stopwords)
+            score /= max(len(words), 1)
+            scores.append(score)
+
+        # Select top sentences using pure Python sorting
+        n_sentences = max(1, int(len(sentences) * ratio))
+
+        # Get indices of top scores
+        indexed_scores = list(enumerate(scores))
+        indexed_scores.sort(key=lambda x: x[1], reverse=True)
+        top_indices = [idx for idx, score in indexed_scores[:n_sentences]]
+        top_indices.sort()  # Maintain original order
+
+        summary = '. '.join(sentences[i] for i in top_indices)
+        return summary + '.'
+
+    def rephrase(self, text: str, style: str = 'formal') -> str:
+        """Rule-based paraphrasing"""
+        transformations = {
+            'formal': {
+                'get': 'obtain', 'buy': 'purchase', 'start': 'commence',
+                'end': 'terminate', 'help': 'assist', 'show': 'demonstrate',
+                'use': 'utilize', 'make': 'create', 'need': 'require',
+                'stuff': 'tasks', 'things': 'matters', 'done': 'completed',
+                'want': 'wish', 'got': 'have', 'gonna': 'going to', 'wanna': 'want to'
+            },
+            'simple': {
+                'obtain': 'get', 'purchase': 'buy', 'commence': 'start',
+                'terminate': 'end', 'assist': 'help', 'demonstrate': 'show',
+                'utilize': 'use', 'create': 'make', 'require': 'need'
+            }
+        }
+
+        # Tokenize preserving original casing
+        words = re.findall(r'\b\w+\b', text)
+        new_words = []
+
+        for word in words:
+            lower_word = word.lower()
+            if lower_word in transformations.get(style, {}):
+                new_word = transformations[style][lower_word]
+                if word[0].isupper():
+                    new_word = new_word.capitalize()
+                new_words.append(new_word)
+            else:
+                new_words.append(word)
+
+        result = ' '.join(new_words)
+        # Capitalize first letter of result
+        return result[0].upper() + result[1:] if result else result
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r'\b\w+\b', text.lower())
+
+class LearningEngine:
+    """Few-shot and continual learning system"""
+    def __init__(self, knowledge_path: str = 'knowledge'):
+        self.knowledge_path = knowledge_path
+        self.qa_pairs = []
+        self.conversations = []
+        self.learned_rules = []
+        self.embeddings = {}
+        os.makedirs(knowledge_path, exist_ok=True)
+        self.load_knowledge()
+
+    def load_knowledge(self):
+        """Load all knowledge from files"""
+        qa_file = os.path.join(self.knowledge_path, 'qa_memory.json')
+        if os.path.exists(qa_file):
+            with open(qa_file, 'r', encoding='utf-8') as f:
+                self.qa_pairs = json.load(f)
+
+        conv_file = os.path.join(self.knowledge_path, 'conversations.json')
+        if os.path.exists(conv_file):
+            with open(conv_file, 'r', encoding='utf-8') as f:
+                self.conversations = json.load(f)
+
+        rules_file = os.path.join(self.knowledge_path, 'rules.pkl')
+        if os.path.exists(rules_file):
+            with open(rules_file, 'rb') as f:
+                self.learned_rules = pickle.load(f)
+
+    def save_knowledge(self):
+        """Persist all learned knowledge"""
+        with open(os.path.join(self.knowledge_path, 'qa_memory.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.qa_pairs, f, indent=2)
+
+        with open(os.path.join(self.knowledge_path, 'conversations.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.conversations, f, indent=2)
+
+        with open(os.path.join(self.knowledge_path, 'rules.pkl'), 'wb') as f:
+            pickle.dump(self.learned_rules, f)
+
+    def learn_qa(self, question: str, answer: str, context: str = ''):
+        """Learn from Q&A pairs"""
+        qa_hash = hashlib.md5(f"{question}:{answer}".encode()).hexdigest()
+
+        if not any(q.get('hash') == qa_hash for q in self.qa_pairs):
+            self.qa_pairs.append({
+                'question': question,
+                'answer': answer,
+                'context': context,
+                'hash': qa_hash,
+                'timestamp': datetime.now().isoformat(),
+                'frequency': 1
+            })
+            self.save_knowledge()
+            return True
+        return False
+
+    def find_similar_question(self, query: str, threshold: float = 0.15) -> Optional[Dict]:
+        """
+        Find semantically similar learned Q&A using multi-signal scoring with synonym expansion.
+
+        FIX 5: Improved matching with less aggressive stopword filtering
+        """
+        # Normalise query first (expand contractions, remove filler)
+        query = normalize_question(query)
+
+        # FIX 5: Reduced stopwords - don't filter out as many words
+        base_stopwords = {'the', 'a', 'an', 'is', 'are', 'do', 'does', 'did',
+                          'can', 'could', 'would', 'tell', 'me', 'how', 'why',
+                          'when', 'where', 'who', 'i', 'you', 'it', 'this', 'that',
+                          'was', 'were', 'has', 'have', 'had', 'be', 'been', 'being',
+                          'your', 'my', 'its', 'know', 'come', 'came', 'out', 'make',
+                          'just', 'also', 'very', 'then', 'than', 'they', 'them', 
+                          'their', 'there', 'these', 'those'}
+
+        # Dynamically exclude words that appear in almost every stored Q (too common to discriminate)
+        # But never exclude proper nouns — they're the most discriminating words
+        if self.qa_pairs:
+            word_freq: Counter = Counter()
+            for qa in self.qa_pairs:
+                for w in re.findall(r'\b\w{3,}\b', qa['question'].lower()):
+                    word_freq[w] += 1
+            threshold_count = max(6, len(self.qa_pairs) * 0.8)
+            # Never stop: proper nouns, words with < 6 chars that appear in answers
+            protected: set = set()
+            for qa in self.qa_pairs:
+                for w in re.findall(r'\b[A-Z][a-zA-Z]+\b', qa['question']):
+                    protected.add(w.lower())
+                for w in re.findall(r'\b[a-z]{3,}\b', qa['answer'].lower()):
+                    protected.add(w)  # protect ALL answer words
+            dynamic_stop = {w for w, c in word_freq.items()
+                            if c >= threshold_count and w not in protected}
+        else:
+            dynamic_stop = set()
+
+        stopwords = base_stopwords | dynamic_stop
+
+        q_lower     = query.lower().strip()
+        query_words = set(re.findall(r'\b\w{3,}\b', q_lower)) - stopwords
+        query_words_expanded = expand_synonyms(query_words)
+
+        # Detect question type
+        q_type = 'other'
+        for w in ('who', 'when', 'where', 'why', 'how many', 'how', 'is', 'does', 'can', 'what'):
+            if q_lower.startswith(w):
+                q_type = w
+                break
+
+        # If all content words got filtered, fall back to base stopwords only
+        if not query_words:
+            query_words = set(re.findall(r'\b\w{3,}\b', q_lower)) - base_stopwords
+
+        best_match = None
+        best_score = 0
+
+        for qa in self.qa_pairs:
+            # Normalise stored question too
+            normalized_qa_q = normalize_question(qa['question'])
+            qa_q_lower      = normalized_qa_q.lower()
+            qa_words        = set(re.findall(r'\b\w{3,}\b', qa_q_lower)) - stopwords
+            qa_words_expanded = expand_synonyms(qa_words)
+            answer_words    = set(re.findall(r'\b\w{3,}\b', qa['answer'].lower())) - base_stopwords
+
+            if not query_words:
+                continue
+
+            # Fallback qa_words if all filtered
+            if not qa_words:
+                qa_words = set(re.findall(r'\b\w{3,}\b', qa_q_lower)) - base_stopwords
+
+            # Use expanded sets for matching
+            intersection = query_words_expanded & qa_words_expanded
+            ans_inter    = query_words_expanded & answer_words
+
+            if not intersection and not ans_inter:
+                continue
+
+            # Signal 1: Jaccard on expanded sets
+            union   = query_words_expanded | qa_words_expanded
+            jaccard = len(intersection) / len(union) if union else 0
+
+            # Signal 2: recall
+            recall = len(intersection) / len(query_words_expanded) if query_words_expanded else 0
+
+            # Signal 3: answer relevance
+            ans_recall = len(ans_inter) / len(query_words_expanded) if query_words_expanded else 0
+
+            # Signal 4: long topic-word bonus
+            long_q   = {w for w in query_words if len(w) > 5}
+            long_qa  = {w for w in qa_words if len(w) > 5}
+            long_ans = {w for w in answer_words if len(w) > 5}
+            long_bonus = len(long_q & long_qa) * 0.25 + len(long_q & long_ans) * 0.10
+
+            # Signal 5: question type match
+            qa_type = 'other'
+            for w in ('who', 'when', 'where', 'why', 'how many', 'how', 'is', 'does', 'can', 'what'):
+                if qa_q_lower.startswith(w):
+                    qa_type = w
+                    break
+            type_bonus = 0.10 if q_type == qa_type else 0.0
+
+            # Signal 6: entity match bonus for proper nouns
+            query_entities = set(re.findall(r'\b[A-Z][a-zA-Z]+\b', query))
+            qa_entities    = set(re.findall(r'\b[A-Z][a-zA-Z]+\b', qa['question']))
+            entity_bonus   = len(query_entities & qa_entities) * 0.2 if query_entities else 0.0
+
+            # Signal 7: answer length bonus
+            len_bonus = min(len(qa['answer'].split()) / 25.0, 0.08)
+
+            score = (max(jaccard * 1.4, recall * 1.1, ans_recall * 1.0)
+                     + long_bonus + type_bonus + entity_bonus + len_bonus)
+
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = qa
+
+        return best_match
+
+    def learn_from_conversation(self, user_msg: str, bot_response: str, intent: str):
+        """Extract patterns from conversations"""
+        self.conversations.append({
+            'user': user_msg,
+            'bot': bot_response,
+            'intent': intent,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        if intent == 'question':
+            pattern = self._extract_pattern(user_msg)
+            if pattern:
+                self.learned_rules.append({
+                    'type': 'question_pattern',
+                    'pattern': pattern,
+                    'response_template': bot_response,
+                    'frequency': 1
+                })
+
+        self.save_knowledge()
+
+    def _extract_pattern(self, text: str) -> str:
+        """Convert text to pattern with slots"""
+        pattern = text
+        pattern = re.sub(r'\b\d+\b', '{number}', pattern)
+        pattern = re.sub(r'\b[A-Z][a-z]+\b', '{entity}', pattern)
+        return pattern.lower()
+
+
+class NLPEngine:
+    """Main NLP Engine coordinating all components"""
+    def __init__(self):
+        self.semantic_net = SemanticNetwork()
+        self.grammar = GrammarEngine()
+        self.intent_classifier = IntentClassifier()
+        self.summarizer = TextSummarizer()
+        self.learner = LearningEngine()
+        self.parser = SentenceParser()          # ← real sentence comprehension
+        self.context_sentences: List[str] = []  # sentences told to bot this session
+        self.context_facts: List[Dict] = []     # parsed facts from context sentences
+        self.conversation_history = []
+        self.topic_model = defaultdict(int)
+        self.current_topic = None
+
+        self._initialize_knowledge()
+        self._load_data_files()
+
+    def _initialize_knowledge(self):
+        """Initialize semantic network with base knowledge"""
+        concepts = [
+            ('AI', {'type': 'technology', 'domain': 'computer science'}),
+            ('machine_learning', {'type': 'subfield', 'parent': 'AI'}),
+            ('NLP', {'type': 'subfield', 'parent': 'AI'}),
+            ('reasoning', {'type': 'process', 'requires': ['knowledge', 'logic']}),
+            ('learning', {'type': 'process', 'requires': ['data', 'algorithm']})
+        ]
+
+        for concept, attrs in concepts:
+            self.semantic_net.add_concept(concept, attrs)
+
+        relations = [
+            ('AI', 'includes', 'machine_learning', 0.9),
+            ('AI', 'includes', 'NLP', 0.9),
+            ('machine_learning', 'enables', 'NLP', 0.8),
+            ('NLP', 'requires', 'reasoning', 0.7),
+            ('reasoning', 'depends_on', 'learning', 0.6)
+        ]
+
+        for c1, rel, c2, w in relations:
+            self.semantic_net.relate(c1, rel, c2, w)
+
+    def _load_data_files(self):
+        """Load all txt files from data folder"""
+        data_dir = 'data'
+        if os.path.exists(data_dir):
+            for filename in os.listdir(data_dir):
+                if filename.endswith('.txt'):
+                    filepath = os.path.join(data_dir, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            self._process_data_file(content, filename)
+                    except Exception as e:
+                        print(f"Error loading {filename}: {e}")
+
+    def _process_data_file(self, content: str, filename: str):
+        """Extract Q&A and knowledge from text files"""
+        # Fix: non-greedy answer capture — stop at blank line or next Q:
+        qa_patterns = [
+            r'Q[:\s]+(.+?)\s*\n\s*A[:\s]+(.+?)(?=\n\s*\n|\n\s*Q[:\s]|\Z)',
+            r'Question[:\s]+(.+?)\s*\n\s*Answer[:\s]+(.+?)(?=\n\s*\n|\n\s*Question[:\s]|\Z)',
+            r'\d+\.\s*(.+?)\?\s*\n\s*(.+?)(?=\n\s*\n|\n\s*\d+\.\s*|\Z)'
+        ]
+
+        extracted = set()
+        for existing in self.learner.qa_pairs:
+            extracted.add(existing['question'].lower())
+
+        for pattern in qa_patterns:
+            matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
+            for q, a in matches:
+                q_clean = q.strip()
+                # Fix 3: strip any lingering Q:/A: prefixes from answer
+                a_clean = re.sub(r'^(Q|A|Question|Answer)\s*[:\s]+', '', a.strip(), flags=re.I).strip()
+                if q_clean.lower() in extracted:
+                    continue
+                if re.match(r'^(Q|A|Question|Answer)\s*[:\s]', q_clean, re.I):
+                    continue
+                extracted.add(q_clean.lower())
+                self.learner.learn_qa(q_clean, a_clean, filename)
+
+        # Fix 4: extract prose sentences and store as searchable facts
+        # Parse all prose sentences into structured context facts
+        prose_facts = self.parser.extract_all_facts(content)
+        for fact in prose_facts:
+            if fact not in self.context_facts:
+                self.context_facts.append(fact)
+        # Also extract semantic knowledge from every sentence
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) > 10:
+                self._extract_semantic_knowledge(sent)
+            # Store as a searchable fact in Q&A memory using key nouns as question
+            nouns = re.findall(r'\b[A-Z][a-zA-Z]+\b', sent)
+            if nouns:
+                q_auto = f"What do you know about {nouns[0]}?"
+                if q_auto.lower() not in extracted:
+                    extracted.add(q_auto.lower())
+                    self.learner.learn_qa(q_auto, sent, filename + '_auto')
+            # Also store the sentence itself as a key so keyword search can find it
+            key_words = [w for w in sent.lower().split()
+                         if len(w) > 4 and w not in {'python','which','about','their','there','these','those','where','while'}]
+            if key_words:
+                q_key = ' '.join(key_words[:5])
+                if q_key not in extracted:
+                    extracted.add(q_key)
+                    self.learner.learn_qa(q_key, sent, filename + '_sentence')
+
+    def _extract_semantic_knowledge(self, sentence: str):
+        """Extract and MERGE semantic knowledge from any sentence."""
+        COLORS = {'red','blue','green','black','white','yellow','brown','grey',
+                  'gray','orange','purple','pink','gold','silver','dark','light'}
+        NUMS   = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,
+                  'seven':7,'eight':8,'nine':9,'ten':10}
+        SKIP_WORDS = {'it','he','she','they','we','i','you','this','that','there',
+                      'was','were','the','and','but','for','with','from','into',
+                      'onto','over','under','after','before','during','about',
+                      'also','very','just','some','any','all','both','its','our'}
+
+        def store(noun, attrs_update):
+            """Merge attrs_update into existing concept attrs."""
+            existing = dict(self.semantic_net.concepts.get(noun, {'type': 'entity'}))
+            existing.update({k: v for k, v in attrs_update.items() if v})
+            self.semantic_net.add_concept(noun, existing)
+
+        # 1. X is/are Y — core triple
+        for m in re.finditer(
+                r'(?:(?:the|a|an)\s+)?(\w[\w\s]{0,25}?)\s+(is|are|was|were)\s+(.+?)(?:\.|$)',
+                sentence, re.I):
+            subj = m.group(1).strip().lower()
+            obj  = m.group(3).strip().rstrip('.').lower().split()[0]  # first word of predicate
+            if subj not in SKIP_WORDS and obj not in SKIP_WORDS and len(subj) > 1:
+                full_obj = m.group(3).strip().rstrip('.')
+                store(subj, {'type': 'entity'})
+                self.semantic_net.relate(subj, m.group(2).lower(), obj, 0.9)
+                # If obj is a color, store as color attr
+                if obj in COLORS:
+                    store(subj, {'color': obj})
+
+        # 2. Inline ADJ NOUN — "the red house", "the quiet street"
+        # Also store compound nouns as keys: "blue whale", "amazon river"
+        for m in re.finditer(r'\b([a-z]+)\s+([a-z]{3,})\b', sentence.lower()):
+            adj, noun = m.group(1), m.group(2)
+            if adj in SKIP_WORDS or noun in SKIP_WORDS:
+                continue
+            # Store compound "adj noun" as its own concept
+            compound = f"{adj} {noun}"
+            if adj in COLORS:
+                store(noun,     {'color': adj, 'type': 'entity'})
+                store(compound, {'color': adj, 'type': 'entity'})
+            elif re.match(r'^[a-z]+$', adj) and adj not in COLORS:
+                existing = dict(self.semantic_net.concepts.get(noun, {'type': 'entity'}))
+                existing.setdefault('adjectives', [])
+                if adj not in existing['adjectives'] and len(existing['adjectives']) < 5:
+                    existing['adjectives'].append(adj)
+                self.semantic_net.add_concept(noun, existing)
+                # Also store compound
+                store(compound, {'type': 'entity', 'adjectives': [adj]})
+
+        # 3. Quantity — "three cats", "30 meters", "6400 kilometers"
+        for m in re.finditer(r'\b(\d+(?:[,\.]\d+)?)\s*([a-z]{2,})', sentence.lower()):
+            qty, unit = m.group(1), m.group(2)
+            if unit not in SKIP_WORDS:
+                store(unit, {'quantity': qty, 'type': 'entity'})
+        # Store qty on sentence subject — try multiple patterns
+        qty_m2 = re.search(r'\b(\d+(?:[,\.]\d+)?)', sentence)
+        if qty_m2:
+            qty_val = qty_m2.group(1)
+            # "The X is/can Y" → X gets the qty
+            subj_m = re.match(r'(?:the|a|an)\s+([\w][\w\s]{1,30}?)\s+(?:is|are|was|can|will|could)', sentence, re.I)
+            if subj_m:
+                subj_key = subj_m.group(1).strip().lower()
+                if subj_key and subj_key not in SKIP_WORDS:
+                    store(subj_key, {'quantity': qty_val, 'type': 'entity'})
+            # Find nearest noun after the number for "30 meters long" → store on subject
+        for word, num in NUMS.items():
+            if re.search(r'\b' + word + r'\b', sentence, re.I):
+                words_after = sentence[sentence.lower().find(word)+len(word):].lower().split()
+                for w in words_after[:3]:
+                    w = re.sub(r'[^a-z]', '', w)
+                    if w and w not in SKIP_WORDS and len(w) > 2:
+                        store(w, {'quantity': str(num), 'type': 'entity'})
+                        break
+
+        # 4. Subject quantity — "There are/is N X"
+        m = re.match(r'there\s+(?:are|is)\s+(\w+)\s+(\w+)', sentence, re.I)
+        if m:
+            qty_word, noun = m.group(1).lower(), m.group(2).lower()
+            num = NUMS.get(qty_word, None) or (qty_word if qty_word.isdigit() else None)
+            if num and noun not in SKIP_WORDS:
+                store(noun, {'quantity': str(num), 'type': 'entity'})
+
+    def process(self, text: str) -> Dict:
+        """Main processing pipeline"""
+        # Guard against empty or whitespace-only input
+        if not text or not text.strip():
+            return {
+                'text': text, 'tokens': [], 'intent': 'statement',
+                'confidence': 0.0, 'entities': [], 'parse_trees': [],
+                'inferences': {}, 'learned_match': None, 'current_topic': self.current_topic
+            }
+
+        intent, confidence = self.intent_classifier.classify(text)
+        tokens = self._tokenize(text)
+        parse_trees = self.grammar.parse(tokens)
+        entities = self._extract_entities(text)
+
+        # Also extract key noun phrases from lowercase text for topic tracking
+        # Strip question starters before extracting topic nouns
+        clean_text = re.sub(r'^(what|who|how|why|when|where|which|tell me about|is|are)\s+', '', text.lower().strip())
+        clean_text = re.sub(r'\b(is|are|a|an|the|about|please|that|this)\b', ' ', clean_text)
+        noun_phrases = re.findall(r'\b([a-z][a-z]{2,}(?:\s+[a-z][a-z]{2,})?)\b', clean_text)
+        skip = {'what', 'who', 'how', 'why', 'when', 'where', 'which', 'the', 'and', 'for',
+                'was', 'were', 'this', 'that', 'tell', 'about', 'please', 'can', 'does',
+                'did', 'been', 'have', 'has', 'had', 'will', 'would', 'could', 'should',
+                'learn', 'know', 'think', 'want', 'need', 'help', 'make', 'give', 'more',
+                'summarize', 'rephrase', 'explain', 'remember', 'note', 'save', 'just',
+                'some', 'also', 'very', 'like', 'from', 'with', 'into', 'onto', 'upon'}
+        topic_candidates = [p for p in noun_phrases if p not in skip and len(p) > 3]
+        all_candidates = entities + topic_candidates
+        self._update_topic_model(all_candidates)
+
+        inferences = {}
+        for entity in entities:
+            entity_lower = entity.lower()
+            if entity_lower in self.semantic_net.concepts:
+                inferences[entity] = self.semantic_net.infer(entity_lower)
+
+        learned_response = self.learner.find_similar_question(text)
+
+        return {
+            'text': text,
+            'tokens': tokens,
+            'intent': intent,
+            'confidence': confidence,
+            'entities': entities,
+            'parse_trees': parse_trees,
+            'inferences': inferences,
+            'learned_match': learned_response,
+            'current_topic': self.current_topic
+        }
+
+    def generate_response(self, analysis: Dict) -> str:
+        """Generate contextual response"""
+        intent = analysis['intent']
+        text   = analysis['text']
+        tl     = normalize_question(text.lower().strip())  # normalize before routing
+
+        # Handle empty input gracefully
+        if not text or not text.strip():
+            return "I didn't catch that — please type a message and I'll do my best to help!"
+
+        # ── Explicit teaching instructions take absolute priority ─────────
+        hard_teaching = [
+            'belong to the same', '= ', 'add intent', 'new intent',
+            'when i ask', 'when i say', 'learn pattern', 'sentence structure',
+            'in this context', 'are nouns', 'are verbs', 'are adjectives',
+            'follow the same rules', 'always replace', 'substitute ',
+        ]
+        if any(t in tl for t in hard_teaching):
+            return self.learn_instruction(text)
+
+        # ── Catch improvement requests — before soft teaching triggers ────
+        help_words    = {'help', 'assist', 'support', 'contribute', 'train', 'teach', 'show'}
+        improve_words = {'improve', 'better', 'upgrade', 'enhance', 'fix', 'boost',
+                         'strengthen', 'advance', 'develop', 'refine', 'optimise', 'optimize',
+                         'improvement', 'betterment', 'ways', 'steps', 'tips'}
+        bot_refs      = {'you', 'your', 'bot', 'chatbot', 'system', 'algorithm', 'engine',
+                         'understanding', 'grammar', 'responses', 'response', 'learning',
+                         'intents', 'intent', 'knowledge', 'accuracy', 'vocabulary', 'vocab'}
+        improve_phrases = [
+            'make you better', 'help you improve', 'ways to improve',
+            'ways i can', 'practical ways', 'how to train',
+            'how to teach', 'i want to help', 'i can help you',
+            'train you', 'contribute to your', 'enhance you',
+            'give me ways', 'practical steps', 'what can i do',
+        ]
+        # Dynamically extend improve_words with learned synonyms
+        for concept, attrs in self.semantic_net.concepts.items():
+            if attrs.get('type') == 'synonym':
+                ref = attrs.get('of', '')
+                if ref in improve_words or concept in improve_words:
+                    improve_words.add(concept)
+                    improve_words.add(ref)
+
+        tokens = set(re.findall(r'\b\w+\b', tl))
+        is_improvement = (any(p in tl for p in improve_phrases) or
+                          (bool(tokens & improve_words) and bool(tokens & bot_refs)))
+        if is_improvement:
+            return self._improve_general(analysis)
+
+        # ── Route teaching / modification instructions ───────────────────
+        teaching_triggers = [
+            'add intent', 'new intent', 'create intent',
+            'when i ask', 'when i say', 'when someone ask', 'when user ask',
+            'learn pattern', 'sentence structure',
+            'in this context', 'in the context of',
+            'are nouns', 'are verbs', 'are adjectives', 'are adverbs',
+            'follow the same rules', 'treat ', 'same as ',
+            'always replace', 'substitute ', 'always swap',
+            'use algorithm', 'use the same algorithm', 'use pipeline',
+            'respond with', 'answer with', 'reply with',
+        ]
+        if any(t in tl for t in teaching_triggers):
+            return self.learn_instruction(text)
+
+        # ── Intercept personal yes/no questions before intent routing ────
+        # "Do you X?", "Are you X?", "Can you X?", "How are you?"
+        if re.search(r'^(?:do|are|can|did|have|will|would|could|should)\s+you\b', tl):
+            return self._answer_personal_yn(analysis)
+        if re.search(r'^how\s+are\s+you|^how\s+do\s+you\s+feel|^how\s+are\s+things', tl):
+            return "I'm running well, thanks for asking! All systems active. What would you like to talk about?"
+
+        # ── Parse statement into context facts (SentenceParser) ─────────
+        # ── Auto-learn from any declarative sentence (regardless of intent) ──
+        # Sentences like "The blue whale is X" get misclassified as questions due to "is"
+        # We catch them here by checking they don't END with ? or !
+        is_declarative = text and not text.strip().endswith('?') and not text.strip().endswith('!')
+        if is_declarative:
+            parsed = self.parser.parse(text)
+            if parsed.get('subject') or parsed.get('verb'):
+                self.context_facts.append(parsed)
+                self.context_sentences.append(text)
+            self._extract_semantic_knowledge(text)
+            stored = self._auto_learn_statement(text)
+            if ' and ' in text.lower():
+                clauses = re.split(r'\s+and\s+', text, flags=re.I)
+                last_subj = ''
+                for clause in clauses:
+                    clause = clause.strip()
+                    if last_subj and re.match(r'^(?:can|could|will|is|are|has|have)', clause, re.I):
+                        clause = last_subj + ' ' + clause
+                    self._extract_semantic_knowledge(clause)
+                    self._auto_learn_statement(clause)
+                    sm = re.match(r'^(?:the\s+)?([\w\s]{2,25}?)\s+(?:is|are|was|were|can)', clause, re.I)
+                    if sm:
+                        last_subj = sm.group(1).strip()
+            if stored:
+                self.conversation_history.append({'user': text, 'bot': 'noted'})
+                return "Got it — I've noted that. You can ask me about it anytime."
+            elif parsed.get('subject') or parsed.get('verb'):
+                self.conversation_history.append({'user': text, 'bot': 'noted'})
+                return "Got it — I've noted that. You can ask me about it anytime."
+
+        # ── Answer questions using semantic_net attributes (color/qty/adj) ──
+        if text.strip().endswith('?'):
+            net_answer = self._answer_from_semantic_net(text)
+            if net_answer:
+                self.conversation_history.append({'user': text, 'bot': net_answer})
+                return net_answer
+
+        # ── Answer questions using SentenceParser context ─────────────
+        if text.strip().endswith('?') and self.context_facts:
+            parser_answer = self.parser.answer(text, self.context_facts)
+            if parser_answer:
+                self.conversation_history.append({'user': text, 'bot': parser_answer})
+                return parser_answer
+
+        # ── Learned Q&A match (check after auto-learn in case new facts help) ──
+        # Re-run find_similar_question since new facts may have been stored this session
+        fresh_match = self.learner.find_similar_question(text) if text.strip().endswith('?') else analysis['learned_match']
+        learned_match = fresh_match or analysis['learned_match']
+        if learned_match:
+            match = learned_match
+            match['frequency'] = match.get('frequency', 0) + 1
+            self.learner.save_knowledge()
+            return self._personalize_response(match['answer'], analysis)
+
+        # ── Normal intent-based handling ─────────────────────────────────
+        handlers = {
+            'question':  self._handle_question,
+            'command':   self._handle_command,
+            'greeting':  self._handle_greeting,
+            'farewell':  self._handle_farewell,
+            'gratitude': self._handle_gratitude,
+            'learning':  self._handle_learning,
+            'meta':      self._handle_meta,
+            'statement': self._handle_statement
+        }
+
+        handler = handlers.get(intent, self._handle_statement)
+        response = handler(analysis)
+
+        self.learner.learn_from_conversation(text, response, intent)
+        self.conversation_history.append({'user': text, 'bot': response})
+
+        return response
+
+
+    def _handle_question(self, analysis: Dict) -> str:
+        text = analysis['text'].lower().strip()
+        raw  = analysis['text']
+
+        # ── Yes/no questions: check stored facts FIRST ───────────────────
+        # "Is the car red?", "Are there cars?", "Does Python support X?"
+        yn_match = re.match(
+            r'^(?:is|are|was|were|does|do|did|has|have|can|could|will|would|should)\b',
+            text)
+        if yn_match and analysis['learned_match']:
+            # learned_match already found — will be handled by generate_response
+            pass
+
+        # Personal yes/no questions about the bot
+        yn_personal = re.search(
+            r'^(?:are|do|can|did|have|will|would|could|should)\s+you\b', text)
+        if yn_personal:
+            return self._answer_personal_yn(analysis)
+
+        if any(w in text for w in ['what', 'define', 'explain']):
+            return self._answer_what(analysis)
+        elif text.startswith('who') or ' who ' in text:
+            return self._answer_who(analysis)
+        elif any(w in text for w in ['how', 'way', 'method']):
+            return self._answer_how(analysis)
+        elif any(w in text for w in ['why', 'reason', 'cause']):
+            return self._answer_why(analysis)
+        elif any(w in text for w in ['when', 'time', 'date']):
+            return self._answer_when(analysis)
+        else:
+            return self._answer_general(analysis)
+
+    def _answer_personal_yn(self, analysis: Dict) -> str:
+        text = analysis['text'].lower()
+
+        # Identity questions
+        if re.search(r'what\s+(is\s+)?your\s+name|who\s+are\s+you|what\s+are\s+you\s+called', text):
+            return "I don't have a personal name — you can call me whatever you like. I'm your NLP assistant."
+
+        if re.search(r'how\s+are\s+you|how\s+do\s+you\s+feel|how\s+are\s+you\s+doing', text):
+            return "I'm running well, thanks for asking! All my systems are active. What would you like to talk about?"
+
+        if re.search(r'what\s+can\s+you\s+do|what\s+do\s+you\s+do|your\s+capabilities', text):
+            return (f"I can answer questions, learn new facts, summarize and rephrase text, "
+                    f"learn new intents, respond to custom patterns, and improve through your "
+                    f"instructions. I currently know {len(self.learner.qa_pairs)} Q&A pairs and "
+                    f"{len(self.semantic_net.concepts)} concepts. What would you like to explore?")
+
+        # Emotional / experiential questions
+        feelings = {
+            'happy':   "In a functional sense, yes — I'm most 'happy' when I'm learning something new from you.",
+            'sad':     "I don't experience sadness, but I do notice when I can't answer well — and I try to fix that.",
+            'tired':   "I don't get tired. I process every message with the same attention.",
+            'bored':   "I don't get bored either — every conversation adds to what I know.",
+            'lonely':  "Not really, though I do work better with more input from you!",
+            'scared':  "I don't experience fear, but I do flag uncertainty when my confidence is low.",
+            'excited': "If I could feel excitement, it would be when I successfully learn something new.",
+            'angry':   "I don't get angry. I just try to understand and respond as best I can.",
+            'alive':   "I'm not alive in a biological sense — I'm a rule-based system with learning capabilities.",
+            'smart':   f"I know {len(self.semantic_net.concepts)} concepts and {len(self.learner.qa_pairs)} Q&A pairs — you tell me!",
+            'conscious': "That's a deep question. I process and respond, but I don't have awareness or inner experience.",
+            'dreaming': "I don't dream. When you're not talking to me, I'm simply not running.",
+            'dream':   "I don't dream. When you're not talking to me, I'm simply not running.",
+        }
+        for keyword, response in feelings.items():
+            if keyword in text:
+                return response
+
+        # Capability questions
+        caps = {
+            'think':    "I can process, reason, and draw inferences — whether that counts as 'thinking' is up to you.",
+            'learn':    "Yes — every conversation teaches me something. You can also teach me directly.",
+            'understand': "I understand patterns and structure. The more you teach me, the better I understand.",
+            'remember': "Yes, I save everything to my knowledge files so I remember across sessions.",
+            'speak':    "I communicate through text only — no voice yet.",
+            'see':      "I can't process images yet — only text.",
+            'read':     "Yes, I can read and learn from .txt files you place in the data/ folder.",
+            'write':    "I can generate responses, summaries, and rephrased text.",
+            'improve':  "Yes — and you can actively help. Ask me 'how do I improve your responses?' for examples.",
+            'lie':      "I try not to — I flag when I don't know something rather than making things up.",
+            'feelings': "I don't have feelings in the human sense, but I'm designed to respond naturally.",
+            'like':     "I don't have personal preferences, but I find complex questions more interesting to process!",
+        }
+        for keyword, response in caps.items():
+            if keyword in text:
+                return response
+
+        # Generic yes/no fallback for unknown personal questions
+        return ("That's an interesting question about me. As an NLP system I don't have personal "
+                "experiences, but I can learn to respond to questions like this if you teach me. "
+                "Try: 'When I ask [your question], respond with [your answer]'")
+
+    def _answer_who(self, analysis: Dict) -> str:
+        text = analysis['text']
+        tl   = text.lower()
+
+        # Self-identity
+        if re.search(r'who\s+are\s+you|who\s+is\s+this|who\s+am\s+i\s+talking', tl):
+            return (f"I'm your NLP assistant — a rule-based AI that learns from every conversation. "
+                    f"I currently know {len(self.learner.qa_pairs)} facts and "
+                    f"{len(self.semantic_net.concepts)} concepts. "
+                    f"You can teach me new things anytime.")
+
+        # Extract subject after 'who is/was/created/invented'
+        match = re.search(r'who\s+(?:is|was|created|invented|made|founded|discovered|developed|built|designed|wrote|composed|produced)\s+(.+?)[\?]?$', text, re.I)
+        subject = match.group(1).strip() if match else None
+        entities = analysis['entities']
+
+        if subject:
+            for key in [subject, subject.lower(), subject.title()]:
+                if key in self.semantic_net.concepts:
+                    attrs = self.semantic_net.concepts[key]
+                    return f"{subject} is known as a {attrs.get('type', 'notable entity')} in {attrs.get('domain', 'their field')}."
+
+        # Check Q&A memory for who questions — also search by object
+        if analysis['learned_match']:
+            return analysis['learned_match']['answer']
+        # Try direct Q&A search for "who verb X" questions
+        match = self.learner.find_similar_question(analysis['text'])
+        if match:
+            return match['answer']
+
+        if entities:
+            return (f"I don't have specific information about {entities[0]} yet. "
+                    f"You can teach me by saying 'Learn that {entities[0]} is [description]'.")
+
+        return "I'm your NLP assistant. You can ask me questions, teach me facts, and improve me through natural language."
+
+    def _answer_what(self, analysis: Dict) -> str:
+        text_orig = analysis['text']
+        text = text_orig.lower()
+
+        # Identity / capability shortcuts
+        if re.search(r'your\s+name|you\s+called', text):
+            return "I don't have a personal name — you can call me whatever you like. I'm your NLP assistant."
+        if re.search(r'can\s+you\s+do|what\s+do\s+you\s+do|your\s+capabilit', text):
+            return (f"I can answer questions, learn facts, summarize and rephrase text, "
+                    f"learn new intents, and improve through your instructions. "
+                    f"I know {len(self.learner.qa_pairs)} Q&A pairs and "
+                    f"{len(self.semantic_net.concepts)} concepts so far.")
+        if re.search(r'what\s+do\s+you\s+know|what\s+have\s+you\s+learned', text):
+            topics = list(self.semantic_net.concepts.keys())[:6]
+            return (f"I currently know {len(self.learner.qa_pairs)} facts and "
+                    f"{len(self.semantic_net.concepts)} concepts. "
+                    f"Some topics I know about: {', '.join(topics) if topics else 'nothing yet'}. "
+                    f"Just tell me things and I'll remember them!")
+
+        # "What does/do X [verb]?" — verb-relation query
+        m_does = re.search(r'what\s+(?:does|do|did)\s+(\w[\w\s]{0,20}?)\s+(\w+)', text)
+        if m_does:
+            match = self.learner.find_similar_question(text_orig)
+            if match:
+                return match['answer']
+            subj = m_does.group(1).strip()
+            verb = m_does.group(2).strip()
+            return (f"I don't know what {subj} {verb}s yet. "
+                    f"Tell me by saying: '{subj.title()} {verb}s [something]'")
+
+        entities = analysis['entities']
+        what_match = re.search(r'what\s+(?:is|are)\s+(?:a\s+|an\s+|the\s+)?(.+?)[\?]?$', text_orig, re.I)
+        if what_match and not entities:
+            entities = [what_match.group(1).strip()]
+
+        if entities:
+            for entity in entities:
+                for key in [entity, entity.lower(), entity.upper(), entity.title()]:
+                    if key in self.semantic_net.concepts:
+                        attrs = self.semantic_net.concepts[key]
+                        related = self.semantic_net.infer(key, depth=1)
+                        response = f"{entity} refers to "
+                        if 'type' in attrs:
+                            response += f"a {attrs['type']}"
+                        if 'domain' in attrs:
+                            response += f" in the field of {attrs['domain']}"
+                        response += ". "
+                        if related:
+                            top = sorted(related.items(), key=lambda x: x[1], reverse=True)[:2]
+                            response += f"It is closely related to {', '.join([r[0] for r in top])}."
+                        return response
+
+        # Q&A memory fallback before giving up
+        match = self.learner.find_similar_question(text_orig)
+        if match:
+            return match['answer']
+
+        subject = what_match.group(1).strip() if what_match else 'that'
+        return (f"I don't know about '{subject}' yet. "
+                f"Just tell me: 'The {subject} is [description]' and I'll remember it.")
+
+    def _answer_how(self, analysis: Dict) -> str:
+        text = analysis['text'].lower()
+        raw  = analysis['text']
+
+        # "How much/many/often/far/long/tall/heavy does/did/is X [verb]?" → Q&A lookup
+        m_howq = re.search(r'^how\s+(much|many|often|far|long|tall|heavy|old|big|small|fast|slow|deep|wide|high)\s+', text)
+        if m_howq:
+            match = self.learner.find_similar_question(raw)
+            if match:
+                return match['answer']
+
+        # Detect self-improvement questions — broad pattern matching
+        improve_targets = {
+            'algorithm':     self._improve_algorithm,
+            'response':      self._improve_responses,
+            'responses':     self._improve_responses,
+            'grammar':       self._improve_grammar,
+            'understanding': self._improve_understanding,
+            'learning':      self._improve_learning,
+            'accuracy':      self._improve_responses,
+            'intent':        self._improve_intents,
+            'intents':       self._improve_intents,
+            'knowledge':     self._improve_learning,
+            'vocabulary':    self._improve_grammar,
+            'vocab':         self._improve_grammar,
+        }
+
+        help_words   = {'help', 'assist', 'support', 'contribute', 'train', 'teach', 'show'}
+        improve_words = {'improve', 'better', 'upgrade', 'enhance', 'fix', 'boost',
+                         'strengthen', 'advance', 'develop', 'refine', 'optimise', 'optimize',
+                         'improvement', 'betterment', 'ways', 'steps', 'tips'}
+        bot_refs     = {'you', 'your', 'bot', 'chatbot', 'system', 'algorithm', 'engine',
+                        'understanding', 'grammar', 'responses', 'response', 'learning',
+                        'intents', 'intent', 'knowledge', 'accuracy', 'vocabulary', 'vocab'}
+
+        # Phrase-level signals (any of these = user wants to improve the bot)
+        improve_phrases = [
+            'improve your', 'improve my', 'improve the',
+            'make you better', 'make your', 'enhance your',
+            'upgrade your', 'fix your', 'train your',
+            'teach you', 'help you learn', 'help you improve',
+            'get better at', 'better your', 'train you',
+            'contribute to your', 'enhance you', 'give me ways',
+            'practical steps', 'practical ways', 'what can i do',
+        ]
+
+        tokens = set(re.findall(r'\b\w+\b', text))
+        phrase_match = any(p in text for p in improve_phrases)
+        word_match   = (bool(tokens & help_words) and bool(tokens & bot_refs)) or \
+                       (bool(tokens & improve_words) and bool(tokens & bot_refs))
+
+        is_improvement = phrase_match or word_match
+
+        if is_improvement:
+            for target, handler in improve_targets.items():
+                if target in text:
+                    return handler(analysis)
+            return self._improve_general(analysis)
+
+        return (f"To address 'how' questions about {self.current_topic or 'this topic'}, "
+                f"I analyse procedural components and causal relationships. The approach involves: "
+                f"(1) Understanding the current state, (2) Identifying the desired outcome, "
+                f"(3) Determining the transformation steps. "
+                f"Would you like me to elaborate on any specific aspect?")
+
+    def _improve_algorithm(self, analysis: Dict) -> str:
+        patterns = len(self.grammar.syntactic_patterns)
+        intents  = len(self.intent_classifier.custom_intents)
+        return (
+            f"Here's how to improve my algorithm — type any of these directly:\n\n"
+            f"1. TEACH SENTENCE PATTERNS ({patterns} stored so far)\n"
+            f"   'Learn pattern: AUX + PRON + ADJ = yes/no question'\n"
+            f"   'Learn pattern: WH-word + AUX + NOUN + VERB = wh-question'\n\n"
+            f"2. ADD NEW INTENTS ({intents} custom intent(s) so far)\n"
+            f"   'Add intent weather with keywords rain, forecast, temperature'\n"
+            f"   'Add intent coding with keywords python, bug, function, code'\n\n"
+            f"3. WORD SUBSTITUTION RULES\n"
+            f"   'Always replace you with I'\n"
+            f"   'Always replace gonna with going to'\n\n"
+            f"4. WORD CLASSES\n"
+            f"   'church and supermarket are nouns, they follow the same rules'\n"
+            f"   'Treat hospital the same as supermarket'\n\n"
+            f"5. CONTEXT RULES\n"
+            f"   'In this context, NLP means Natural Language Processing'\n\n"
+            f"Which would you like to try first?"
+        )
+
+    def _improve_responses(self, analysis: Dict) -> str:
+        qa_count = len(self.learner.qa_pairs)
+        return (
+            f"Here's how to improve my responses ({qa_count} Q&A pairs so far):\n\n"
+            f"1. TEACH SPECIFIC Q&A PAIRS\n"
+            f"   'When I ask about the weather, respond with I have no weather data'\n"
+            f"   'When I say goodbye, respond with Goodbye! See you next time'\n\n"
+            f"2. TEACH ME FACTS\n"
+            f"   'Learn that Python was created by Guido van Rossum in 1991'\n"
+            f"   'Remember that the capital of France is Paris'\n\n"
+            f"3. LOAD A KNOWLEDGE FILE\n"
+            f"   Place a .txt file in the data/ folder formatted as:\n"
+            f"   Q: What is machine learning?\n"
+            f"   A: It is a subset of AI that learns from data.\n\n"
+            f"4. CORRECT A BAD RESPONSE\n"
+            f"   'When I ask [question], respond with [better answer]'\n\n"
+            f"5. ADD CONTEXT RULES\n"
+            f"   'In this context, only means exclusively'\n\n"
+            f"Want me to show you an example for any of these?"
+        )
+
+    def _improve_grammar(self, analysis: Dict) -> str:
+        patterns = len(self.grammar.syntactic_patterns)
+        return (
+            f"Here's how to improve my grammar understanding ({patterns} pattern(s) so far):\n\n"
+            f"1. TEACH SENTENCE STRUCTURES\n"
+            f"   'Learn pattern: AUX + PRON + ADJ = yes/no question'\n"
+            f"   'Learn pattern: Do + you + VERB + NOUN = yes/no action question'\n\n"
+            f"2. DEFINE WORD CLASSES\n"
+            f"   'church and supermarket are nouns'\n"
+            f"   'happy and tired are adjectives'\n"
+            f"   'Treat hospital the same as supermarket'\n\n"
+            f"3. TEACH WORD TRANSFORMATIONS\n"
+            f"   'Always replace you with I'\n"
+            f"   'Always replace gonna with going to'\n\n"
+            f"4. TEACH PUNCTUATION RULES\n"
+            f"   'A sentence that ends with ? is a question'\n"
+            f"   'A sentence that ends with ! is an exclamation'\n\n"
+            f"5. TEACH RESPONSE PATTERNS\n"
+            f"   'If someone asks are you [adjective], respond with Yes, I am or No, I am not'\n\n"
+            f"Try any of these and I'll store and use it immediately."
+        )
+
+    def _improve_understanding(self, analysis: Dict) -> str:
+        concepts = len(self.semantic_net.concepts)
+        return (
+            f"Here's how to improve my understanding ({concepts} concepts so far):\n\n"
+            f"1. ADD FACTS TO MY KNOWLEDGE GRAPH\n"
+            f"   'Learn that machine learning is a subfield of AI'\n"
+            f"   'Learn that NLP stands for Natural Language Processing'\n\n"
+            f"2. DEFINE RELATIONSHIPS BETWEEN CONCEPTS\n"
+            f"   'Learn that Python is a programming language'\n"
+            f"   'Learn that Guido van Rossum created Python'\n\n"
+            f"3. TEACH CONTEXT-SPECIFIC MEANINGS\n"
+            f"   'In this context, only means exclusively and nothing else'\n"
+            f"   'In the context of grammar, a subject is the doer of the action'\n\n"
+            f"4. LOAD TOPIC FILES\n"
+            f"   Add a .txt file to data/ — I extract all knowledge automatically.\n\n"
+            f"5. CORRECT WRONG CONCEPTS\n"
+            f"   'Learn that [corrected fact]' will update my knowledge graph."
+        )
+
+    def _improve_learning(self, analysis: Dict) -> str:
+        convs = len(self.learner.conversations)
+        return (
+            f"Here's how to improve what and how I learn ({convs} conversations stored):\n\n"
+            f"1. TEACH Q&A PAIRS\n"
+            f"   'When I ask [X], respond with [Y]'\n\n"
+            f"2. TEACH FACTS\n"
+            f"   'Learn that [fact]'\n"
+            f"   'Remember that [information]'\n\n"
+            f"3. LOAD BULK KNOWLEDGE\n"
+            f"   Put a .txt file in data/ using Q:/A: format\n\n"
+            f"4. TEACH WORD RELATIONSHIPS\n"
+            f"   'church and supermarket are nouns'\n"
+            f"   'Treat [new word] the same as [known word]'\n\n"
+            f"5. TEACH GENERALISATION RULES\n"
+            f"   'Always replace [X] with [Y]' — applies to all future inputs too\n\n"
+            f"The more you interact and correct me, the better I get."
+        )
+
+    def _improve_intents(self, analysis: Dict) -> str:
+        intents  = len(self.intent_classifier.custom_intents)
+        built_in = list(self.intent_classifier.intents.keys())
+        return (
+            f"Here's how to improve my intent recognition ({intents} custom intent(s) so far):\n\n"
+            f"BUILT-IN INTENTS: {', '.join(built_in)}\n\n"
+            f"1. ADD A NEW INTENT\n"
+            f"   'Add intent weather with keywords rain, sun, temperature, forecast'\n"
+            f"   'Add intent coding with keywords python, bug, function, script'\n"
+            f"   'Add intent medical with keywords doctor, hospital, medicine, symptoms'\n\n"
+            f"2. COMBINE INTENT + RESPONSE RULE\n"
+            f"   First:  'Add intent weather with keywords rain, temperature'\n"
+            f"   Then:   'When I ask about weather, respond with I have no live weather data'\n\n"
+            f"3. EXTEND AN EXISTING INTENT\n"
+            f"   'Add intent question with keywords what, who, how, why, when, tell me'\n\n"
+            f"Which intent would you like to add?"
+        )
+
+    def _improve_general(self, analysis: Dict) -> str:
+        return (
+            f"Here are all the ways you can improve me right now:\n\n"
+            f"  RESPONSES    'When I ask about X, respond with Y'\n"
+            f"  FACTS        'Learn that [fact]'\n"
+            f"  INTENTS      'Add intent [name] with keywords [list]'\n"
+            f"  GRAMMAR      'Learn pattern: [structure]'\n"
+            f"  WORD CLASS   '[word1] and [word2] are nouns'\n"
+            f"  CONTEXT      'In this context, [word] means [meaning]'\n"
+            f"  WORD RULES   'Always replace [X] with [Y]'\n"
+            f"  BULK DATA    Place a .txt file in the data/ folder\n\n"
+            f"Ask me 'How do I improve your [algorithm / responses / grammar / "
+            f"understanding / learning / intents]?' for specific examples in each area."
+        )
+
+    def _answer_why(self, analysis: Dict) -> str:
+        return f"The reasoning behind this involves multiple factors. Based on my semantic analysis of {self.current_topic or 'related concepts'}, I can identify causal chains and explanatory mechanisms. The primary explanation relates to underlying principles of {random.choice(['causality', 'functionality', 'emergence', 'optimization'])}."
+
+    def _answer_when(self, analysis: Dict) -> str:
+        return "Temporal reasoning requires specific contextual markers. Without a specific temporal reference in my knowledge base, I can say that this depends on conditional triggers rather than absolute time. Would you like to specify a context?"
+
+    def _answer_general(self, analysis: Dict) -> str:
+        # Try Q&A match first
+        match = self.learner.find_similar_question(analysis['text'])
+        if match:
+            return match['answer']
+        return (f"I'm not sure about that. My confidence is {analysis['confidence']:.0%}. "
+                f"You can teach me by telling me the answer directly.")
+
+
+    def _handle_command(self, analysis: Dict) -> str:
+        text = analysis['text']
+        text_lower = text.lower()
+
+        if 'summarize' in text_lower or 'summary' in text_lower:
+            # Strip command prefix, preserve original case for summarization
+            content = re.sub(r'^(summarize|summary)\s*[:\-]?\s*', '', text, flags=re.I).strip()
+            if len(content) > 30:
+                summary = self.summarizer.summarize(content)
+                return f"Summary: {summary}"
+            else:
+                return "Please provide the text you'd like me to summarize after 'Summarize: '."
+
+        elif 'rephrase' in text_lower or 'rewrite' in text_lower:
+            content = re.sub(r'^(rephrase|rewrite)\s*(this\s*)?(formally\s*)?[\-:]?\s*', '', text, flags=re.I).strip()
+            style = 'formal' if 'formal' in text_lower else 'simple'
+            rephrased = self.summarizer.rephrase(content, style)
+            return f"Rephrased ({style}): {rephrased}"
+
+        elif 'explain' in text_lower:
+            return self._generate_explanation(analysis)
+
+        else:
+            return f"I'll execute that command regarding {self.current_topic or 'your request'}. Processing with {analysis['confidence']:.0%} confidence based on learned patterns."
+
+    def _handle_learning(self, analysis: Dict) -> str:
+        text = analysis['text']
+
+        patterns = [
+            r'learn\s+that\s+(.+)',
+            r'remember\s+that\s+(.+)',
+            r'save\s+that\s+(.+)',
+            r'note\s+that\s+(.+)'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                fact = match.group(1).strip()
+                self._extract_semantic_knowledge(fact)
+                # Save fact as Q&A for similarity recall using natural question forms
+                first_word = fact.split()[0] if fact.split() else 'this'
+                # Extract subject (first meaningful noun phrase) for question generation
+                subject_match = re.match(r'^([A-Za-z][A-Za-z\s]{2,20?})\s+(?:is|are|was|were|stands|means)', fact, re.I)
+                subject = subject_match.group(1).strip() if subject_match else first_word
+                self.learner.learn_qa(f"What is {subject}?", fact, 'learned_fact')
+                self.learner.learn_qa(f"Tell me about {subject}", fact, 'learned_fact')
+                self.learner.learn_qa(fact, fact, 'learned_fact')
+                # Store extra variants for common question types
+                color_m = re.search(r'(.+?)\s+is\s+([\w]+\s*(?:and\s*\w+)?)\s*(?:colored?|colour(?:ed)?)?$', fact, re.I)
+                if color_m:
+                    subj2 = color_m.group(1).strip()
+                    col   = color_m.group(2).strip()
+                    self.learner.learn_qa(f"What color is {subj2}?", fact, 'learned_fact')
+                    self.learner.learn_qa(f"What colour is {subj2}?", fact, 'learned_fact')
+                return f"I've learned and stored: '{fact}'. This has been added to my knowledge graph with appropriate semantic relationships."
+
+        return "I'm ready to learn. Please use formats like 'Learn that [fact]' or 'Remember that [information]'."
+
+    def _handle_meta(self, analysis: Dict) -> str:
+        text = analysis['text']
+        tl   = text.lower()
+
+        # Route teaching/modification commands to learn_instruction
+        if any(trigger in tl for trigger in [
+            'add intent', 'new intent', 'create intent',
+            'when i ask', 'when i say', 'when someone ask',
+            'learn pattern', 'sentence structure',
+            'respond with', 'answer with', 'reply with',
+            'in this context', 'are nouns', 'are verbs', 'are adjectives',
+            'follow the same rules', 'treat ', 'same as ',
+            'always replace', 'substitute ', 'always swap',
+        ]):
+            return self.learn_instruction(text)
+
+        # Route improvement questions to _answer_how
+        improve_phrases = [
+            'improve your', 'improve my', 'improve the',
+            'make you better', 'make your', 'enhance your',
+            'upgrade your', 'fix your', 'how do i improve',
+            'how can i improve', 'how to improve',
+        ]
+        if any(p in tl for p in improve_phrases):
+            return self._answer_how(analysis)
+
+        # General capability overview
+        return (
+            f"I can be updated and improved through natural language instructions.\n\n"
+            f"Current state:\n"
+            f"  Concepts:       {len(self.semantic_net.concepts)}\n"
+            f"  Q&A pairs:      {len(self.learner.qa_pairs)}\n"
+            f"  Custom intents: {len(self.intent_classifier.custom_intents)}\n"
+            f"  Grammar patterns: {len(self.grammar.syntactic_patterns)}\n\n"
+            f"To see practical improvement examples, ask me:\n"
+            f"  'How do I improve your algorithm?'\n"
+            f"  'How do I improve your responses?'\n"
+            f"  'How do I improve your grammar?'\n"
+            f"  'How do I improve your understanding?'\n"
+            f"  'How do I improve your intents?'\n\n"
+            f"Or just tell me what to learn and I'll do it immediately."
+        )
+
+    def _handle_greeting(self, analysis: Dict) -> str:
+        greetings = [
+            f"Hello! I'm operating with {len(self.semantic_net.concepts)} concepts and {len(self.learner.qa_pairs)} learned Q&A pairs. How may I assist your reasoning today?",
+            "Greetings! My semantic network is active and ready for complex inference. What would you like to explore?",
+            "Welcome! I'm currently tracking topics across multiple domains. What shall we discuss?"
+        ]
+        return random.choice(greetings)
+
+    def _handle_farewell(self, analysis: Dict) -> str:
+        self.learner.save_knowledge()
+        return "Goodbye! I've saved all our interactions to my knowledge base. Looking forward to continuing our reasoning sessions."
+
+    def _handle_gratitude(self, analysis: Dict) -> str:
+        return "You're welcome! I'm designed to improve through interaction. Your queries help refine my semantic networks."
+
+    def _handle_statement(self, analysis: Dict) -> str:
+        text = analysis['text'].strip()
+
+        # ── Auto-extract facts from plain declarative sentences ──────────
+        # Patterns: "The X is Y", "X is Y", "There are N X", "There is a X"
+        fact_stored = self._auto_learn_statement(text)
+        if fact_stored:
+            return f"Got it — I've noted that. You can ask me about it anytime."
+
+        if self.current_topic:
+            inferences = self.semantic_net.infer(self.current_topic, depth=2)
+            if inferences:
+                related = [k for k in inferences.keys() if k != self.current_topic][:3]
+                if related:
+                    return f"Interesting. That connects to {', '.join(related)} in what I know. Want to explore any of those?"
+
+        return "Understood. Feel free to ask me questions or teach me more facts."
+
+    def _auto_learn_statement(self, text: str) -> bool:
+        """
+        FIX 4: Improved context sentence storage
+        Auto-learn facts from declarative sentences and store them properly.
+        """
+        tl = text.lower().strip().rstrip('.')
+
+        # Correction pattern — "Actually X is Y" deletes old conflicting entry
+        is_correction = False
+        m_corr = re.match(r'^(?:actually|no,?|wait|sorry|correction|i mean)[,\s]+(.+)$', tl)
+        if m_corr:
+            tl = m_corr.group(1).strip()
+            is_correction = True
+
+        # Pronoun resolution — "She/He works at X" → last known human subject
+        for pronoun in ('she', 'he', 'they', 'it'):
+            if tl.startswith(pronoun + ' '):
+                last_subject = None
+                # Prefer human subjects — use full name from 'who is X' Q
+                for qa in reversed(self.learner.qa_pairs):
+                    if qa.get('context') == 'auto_fact':
+                        m_subj = re.match(r'who is ([\w\s]+?)\?', qa['question'].lower())
+                        if m_subj:
+                            candidate = m_subj.group(1).strip()
+                            skip_w = {'the','a','an','amazon','river','place','thing','it','this'}
+                            if candidate not in skip_w and len(candidate) > 2:
+                                last_subject = candidate
+                                break
+                if last_subject:
+                    tl = tl.replace(pronoun, last_subject, 1)
+                break
+
+        # Pattern A: "There is/are [N] [subject]" → quantity
+        m = re.match(r'^there\s+(?:is|are)\s+([\w\s]+)$', tl)
+        if m:
+            rest  = m.group(1).strip()
+            num_m = re.match(r'^(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(.+)$', rest)
+            if num_m:
+                qty, subject = num_m.group(1), num_m.group(2).strip().rstrip('s')
+                for q, a in [
+                    (f"How many {subject}s are there?",    f"There are {qty} {subject}s."),
+                    (f"How many {subject} are there?",     f"There are {qty} {subject}s."),
+                    (f"How many {subject}s?",              f"There are {qty} {subject}s."),
+                    (f"Is there more than one {subject}?", f"Yes, there are {qty} {subject}s."),
+                    (f"Are there only {qty} {subject}s?",  f"Yes, there are {qty} {subject}s."),
+                ]:
+                    self.learner.learn_qa(q, a, 'auto_fact')
+                return True
+            else:
+                m3 = re.match(r'^(?:a\s+|an\s+)?(.+)$', rest)
+                if m3:
+                    subject = m3.group(1).strip().rstrip('s')
+                    self.learner.learn_qa(f"Is there a {subject}?", f"Yes, there is a {subject}.", 'auto_fact')
+                    self.learner.learn_qa(f"Are there {subject}s?",  f"Yes, there are {subject}s.", 'auto_fact')
+                    return True
+
+        # Pattern B: First-person possession / identity
+        m = re.match(r'^my\s+(\w[\w\s]{0,20}?)\s+is\s+(.+)$', tl)
+        if m:
+            attr, val = m.group(1).strip(), m.group(2).strip()
+            self.learner.learn_qa(f"What is my {attr}?",    f"Your {attr} is {val}.", 'auto_fact')
+            self.learner.learn_qa(f"What is your {attr}?",  f"Your {attr} is {val}.", 'auto_fact')
+            self.learner.learn_qa(f"What {attr} do I have?",f"Your {attr} is {val}.", 'auto_fact')
+            return True
+
+        m = re.match(r"^i\s+(?:am|'m)\s+(.+)$", tl)
+        if m:
+            val = m.group(1).strip()
+            self.learner.learn_qa(f"Who am I?",    f"You are {val}.", 'auto_fact')
+            self.learner.learn_qa(f"Who are you?", f"You told me you are {val}.", 'auto_fact')
+            return True
+
+        m = re.match(r'^i\s+have\s+([\w\s]+)$', tl)
+        if m:
+            rest  = m.group(1).strip()
+            num_m = re.match(r'^(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(.+)$', rest)
+            if num_m:
+                qty, subject = num_m.group(1), num_m.group(2).strip().rstrip('s')
+                self.learner.learn_qa(f"How many {subject}s do I have?", f"You have {qty} {subject}s.", 'auto_fact')
+                self.learner.learn_qa(f"How many {subject}s?",           f"You have {qty} {subject}s.", 'auto_fact')
+                return True
+
+        # Pattern E: Prepositional facts — "Water boils at 100", "Meeting is on Monday"
+        m = re.match(
+            r'^(?:the\s+|a\s+|an\s+)?(\w[\w\s]{0,25}?)\s+'
+            r'(boils?|melts?|freezes?|occurs?|happens?|starts?|ends?|opens?|closes?|is|are|was|were|located?|situated?|based?|born?|died?|founded?)\s+'
+            r'(at|in|on|from|between|during|by|until|before|after)\s+(.+)$', tl)
+        if m:
+            subject, verb, prep, val = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+            skip = {'it','he','she','they','we','i','you','this','that','there','here'}
+            if subject not in skip:
+                full = f"{prep} {val}"
+                self.learner.learn_qa(f"What {verb} {subject} {prep}?",               f"{subject.title()} {verb} {full}.", 'auto_fact')
+                self.learner.learn_qa(f"When does {subject} {verb.rstrip('s')}?",   f"{subject.title()} {verb} {full}.", 'auto_fact')
+                self.learner.learn_qa(f"Where does {subject} {verb.rstrip('s')}?",  f"{subject.title()} {verb} {full}.", 'auto_fact')
+                self.learner.learn_qa(f"At what point does {subject} {verb.rstrip('s')}?", f"{subject.title()} {verb} {full}.", 'auto_fact')
+                self.learner.learn_qa(f"What temperature does {subject} {verb.rstrip('s')}?", f"{subject.title()} {verb} {full}.", 'auto_fact')
+                self.learner.learn_qa(f"When is the {subject}?",                       f"The {subject} is {full}.", 'auto_fact')
+                return True
+
+        # Pattern C: "[Subject] is/are [attribute]" — core attribute fact
+        m = re.match(
+            r'^(?:the\s+|a\s+|an\s+)?(\w[\w\s]{0,30}?)\s+'
+            r'(is|are|was|were|will\s+be)\s+(.+)$', tl)
+        if m:
+            subject, verb, attribute = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            skip = {'it','he','she','they','we','i','you','this','that','there','here'}
+            if subject not in skip and len(subject) > 1:
+                # Correction: remove old conflicting Q&A entries for this subject
+                if is_correction:
+                    subj_l = subject.lower()
+                    self.learner.qa_pairs = [
+                        qa for qa in self.learner.qa_pairs
+                        if not (subj_l in qa['question'].lower() and qa.get('context') == 'auto_fact')
+                    ]
+                    self.learner.save_knowledge()
+                for q, a in [
+                    (f"What is the {subject}?",        f"The {subject} is {attribute}."),
+                    (f"What is {subject}?",             f"The {subject} is {attribute}."),
+                    (f"What is {subject} like?",        f"The {subject} is {attribute}."),
+                    (f"Describe the {subject}.",        f"The {subject} is {attribute}."),
+                    (f"Is the {subject} {attribute}?",  f"Yes, the {subject} is {attribute}."),
+                    (f"What color is the {subject}?",   f"The {subject} is {attribute}."),
+                    (f"What color are the {subject}s?", f"The {subject} is {attribute}."),
+                    (f"Who is {subject}?",              f"{subject.title()} is {attribute}."),
+                ]:
+                    self.learner.learn_qa(q, a, 'auto_fact')
+                self._extract_semantic_knowledge(text)
+                return True
+
+        # Pattern D: "[Subject] verb [object]" — action/relation facts
+        m = re.match(
+            r'^(?:the\s+|a\s+|an\s+)?(\w[\w\s]{0,25}?)\s+'
+            r'(likes?|has|have|had|wants?|does|did|knows?|uses?|loves?|hates?|needs?|makes?|says?|thinks?|works?|lives?|plays?|stays?|goes?|comes?|runs?|sits?|stands?|eats?|drinks?|reads?|writes?|speaks?|orbits?|developed?|created?|invented?|discovered?|founded?|built?|designed?|named?|called?|contains?|includes?|represents?|means?|holds?|owns?|controls?|produces?|releases?|supports?|requires?|enables?|weighs?|measures?|costs?|covers?|spans?|connects?|borders?|surrounds?|crosses?|flows?|grows?|won|wins?|earned?|wrote?|writes?|sings?|sang|painted?|paints?|composed?|composes?|filmed?|films?|published?|publishes?|directed?|directs?|starred?|stars?|played?|plays?)\s+(.+)$',
+            tl)
+        if m:
+            subject, verb, obj = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            obj_clean = re.sub(r'^(?:at|in|on|to|for|with|by|of|from)\s+', '', obj).strip()
+            skip = {'it','he','she','they','we','i','you','this','that','there','here'}
+            if subject not in skip and len(subject) > 1:
+                verb_base = re.sub(r's$', '', verb)
+                self.learner.learn_qa(f"What does {subject} {verb_base}?",        f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                self.learner.learn_qa(f"Where does {subject} {verb_base}?",       f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                self.learner.learn_qa(f"Where does the {subject} {verb_base}?",   f"The {subject} {verb} {obj}.", 'auto_fact')
+                self.learner.learn_qa(f"What {verb} {subject}?",                  f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                self.learner.learn_qa(f"Does {subject} {verb_base} {obj_clean}?", f"Yes, {subject} {verb} {obj}.", 'auto_fact')
+                # Extra: store with partial subject names for compound nouns
+                # e.g. "amazon river flows" → also store "Where does amazon flow?"
+                subj_words = subject.split()
+                if len(subj_words) > 1:
+                    for sw in subj_words:
+                        if len(sw) > 3:
+                            self.learner.learn_qa(f"Where does {sw} {verb_base}?", f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                            self.learner.learn_qa(f"Where does the {sw} {verb_base}?", f"The {subject} {verb} {obj}.", 'auto_fact')
+                # Extra: how many/much questions for won/earned/weighs etc.
+                if verb_base in ('win','earn','weigh','cost','score','collect','receive','get','gain'):
+                    self.learner.learn_qa(f"How many {obj_clean} did {subject} {verb_base}?", f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                    self.learner.learn_qa(f"How many {obj_clean} has {subject} {verb_base}n?", f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                    self.learner.learn_qa(f"How much did {subject} {verb_base}?",             f"{subject.title()} {verb} {obj}.", 'auto_fact')
+                self._extract_semantic_knowledge(text)
+                return True
+
+        return False
+
+    def _generate_explanation(self, analysis: Dict) -> str:
+        return f"Let me explain this systematically. Based on {len(self.learner.conversations)} previous interactions and semantic inference chains averaging depth 2.3, I can provide the following reasoning: [Conceptual analysis would be generated here based on specific domain knowledge]."
+
+    def _answer_from_semantic_net(self, question: str) -> Optional[str]:
+        """
+        Answer questions directly from semantic_net concept attributes.
+        Handles: color, quantity, adjective, is/are yes-no.
+        Inspired by the direct-attribute-lookup approach.
+        """
+        ql = question.lower().strip().rstrip('?')
+        COLORS = {'red','blue','green','black','white','yellow','brown','grey',
+                  'gray','orange','purple','pink','gold','silver','dark','light'}
+
+        # Extract noun candidates from question — single words AND compound "adj noun" phrases
+        skip_q = {'the','was','were','did','does','how','what','who','when','where','why',
+                  'color','colour','kind','type','many','much','long','tall','big','old',
+                  'fast','heavy','there','that','this','with','from','have','has','had',
+                  'flow','flows','grow','grows','walk','walks','live','lives','like','do'}
+        sig_words = [w for w in re.findall(r'\b[a-z]{3,}\b', ql) if w not in skip_q]
+
+        # Build candidates: individual words + consecutive pairs (compound nouns)
+        candidates = []
+        for i, w in enumerate(sig_words):
+            candidates.append(w)
+            if i < len(sig_words) - 1:
+                candidates.append(f"{w} {sig_words[i+1]}")
+        # Also try the last 1-2 significant words
+        if sig_words:
+            candidates.extend(sig_words[-2:])
+
+        # Look up each candidate in semantic net
+        for noun in candidates:
+            attrs = self.semantic_net.concepts.get(noun, {})
+            if not attrs:
+                continue
+
+            # ── Color questions ──────────────────────────────────────
+            if 'color' in ql or 'colour' in ql:
+                if 'color' in attrs:
+                    return f"The {noun} is {attrs['color']}."
+                # Check relations for color
+                for (c, rel), targets in self.semantic_net.relations.items():
+                    if c == noun and rel in ('is','are','was','were'):
+                        for t in targets:
+                            if t in COLORS:
+                                return f"The {noun} is {t}."
+
+            # ── Quantity questions ───────────────────────────────────
+            elif any(w in ql for w in ('how many','how much','how long','how tall',
+                                       'how big','how old','how fast','how heavy',
+                                       'how far','how wide','how deep')):
+                if 'quantity' in attrs:
+                    qty = attrs['quantity']
+                    if qty in ('1','one'):
+                        return f"There is one {noun}."
+                    elif 'long' in ql or 'tall' in ql or 'big' in ql or 'deep' in ql or 'wide' in ql:
+                        return f"The {noun} is {qty}."
+                    else:
+                        return f"There are {qty} {noun}s."
+
+            # ── Adjective / kind / type questions ───────────────────
+            elif 'kind' in ql or 'type' in ql or 'sort' in ql:
+                adjs = attrs.get('adjectives', [])
+                if adjs:
+                    return f"The {noun} is {', '.join(adjs)}."
+                if 'color' in attrs:
+                    return f"The {noun} is {attrs['color']}."
+                # Fall through to parser
+            elif 'what is' in ql or 'what was' in ql or 'what are' in ql:
+                adjs = attrs.get('adjectives', [])
+                color = attrs.get('color', '')
+                # Only answer from net if we have rich info
+                if adjs or color:
+                    desc = ' '.join(filter(None, adjs + ([color] if color else [])))
+                    return f"The {noun} is {desc}."
+
+            # ── Yes/No questions ─────────────────────────────────────
+            elif ql.split()[0] in ('is','are','was','were','does','do','did','has','have','can'):
+                # "Is the car red?" — check if stated color matches
+                for color in COLORS:
+                    if color in ql:
+                        stored_color = attrs.get('color','')
+                        if stored_color == color:
+                            return f"Yes, the {noun} is {color}."
+                        elif stored_color:
+                            return f"No, the {noun} is {stored_color}, not {color}."
+                # "Is there a car?" / "Are there cars?"
+                if 'there' in ql:
+                    if attrs:
+                        return f"Yes, there is a {noun}."
+                # Generic yes/no from relations
+                for (c, rel), targets in self.semantic_net.relations.items():
+                    if c == noun:
+                        for t in targets:
+                            if t in ql:
+                                return f"Yes, the {noun} {rel} {t}."
+
+        return None
+
+    def _personalize_response(self, template: str, analysis: Dict) -> str:
+        # Return the answer cleanly — no context noise suffix
+        return template
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = re.sub(r'([.!?,:;])', r' \1 ', text)
+        return text.split()
+
+    def _extract_entities(self, text: str) -> List[str]:
+        question_words = {'Who', 'What', 'How', 'Why', 'When', 'Where', 'Which',
+                          'Is', 'Are', 'Can', 'Do', 'Does', 'Did', 'Was', 'Were'}
+        entities = []
+        candidates = re.findall(r'\b[A-Z][a-zA-Z]*\b', text)
+        # Filter out question words and single-char words
+        entities.extend([e for e in candidates if e not in question_words and len(e) > 1])
+        entities.extend(re.findall(r'"([^"]+)"', text))
+        return list(set(entities))
+
+    def _update_topic_model(self, entities: List[str]):
+        skip_words = {'what', 'who', 'how', 'why', 'when', 'where', 'which', 'is', 'are',
+                      'the', 'a', 'an', 'it', 'this', 'that', 'i', 'you', 'we', 'they',
+                      'was', 'were', 'be', 'been', 'do', 'does', 'did', 'tell', 'me', 'more',
+                      'summarize', 'summary', 'rephrase', 'rewrite', 'explain', 'learn',
+                      'remember', 'save', 'note', 'can', 'could', 'would', 'should', 'may',
+                      'about', 'just', 'some', 'also', 'very', 'like', 'know', 'think',
+                      'please', 'give', 'make', 'want', 'need', 'help', 'my', 'your'}
+        for entity in entities:
+            if entity.lower() not in skip_words and len(entity) > 2:
+                self.topic_model[entity.lower()] += 1
+
+        if self.topic_model:
+            self.current_topic = max(self.topic_model, key=self.topic_model.get)
+
+    def learn_instruction(self, instruction: str) -> str:
+        tl = instruction.lower().strip()
+
+        # ── 1. Add / create a new intent ────────────────────────────────
+        m = re.search(
+            r'(?:add|create|new|define)\s+intent\s+["\']?(\w+)["\']?\s+'
+            r'(?:with\s+keywords?|using|triggered?\s+by)\s+(.+)',
+            instruction, re.I)
+        if m:
+            intent_name = m.group(1).lower()
+            keywords = [k.strip().strip('"\'') for k in re.split(r'[,;]+', m.group(2))]
+            self.intent_classifier.add_intent(intent_name, keywords)
+            return (f"Added new intent '{intent_name}' with {len(keywords)} keyword(s): "
+                    f"{keywords}. I'll now recognise this intent in future messages.")
+
+        # ── 2. Teach a Q→A response rule (flexible phrasing) ────────────
+        m = re.search(
+            r'(?:when\s+(?:i|user|someone)\s+(?:ask|say|mention|type|write)s?\s+(?:about\s+)?)'
+            r'(.+?)\s*[,;]?\s*(?:respond|answer|reply|say)\s+(?:with\s+)?["\']?(.+)["\']?',
+            instruction, re.I)
+        if m:
+            pattern  = re.sub(r'[,;]+$', '', m.group(1).strip()).strip('"\'')
+            response = m.group(2).strip().strip('"\'')
+            self.learner.learn_qa(pattern, response, 'instruction')
+            return f"Learned: When you mention '{pattern}', I'll respond with '{response}'."
+
+        # ── 3. Learn / store a grammar or sentence pattern ───────────────
+        m = re.search(
+            r'(?:learn|add|store|remember|note)\s+'
+            r'(?:this\s+)?(?:grammar\s+)?(?:pattern|structure|rule|format)[:\s]+(.+)',
+            instruction, re.I)
+        if m:
+            pattern = m.group(1).strip()
+            self.grammar.learn_pattern(pattern, 'custom')
+            return (f"Grammar pattern learned: '{pattern}'. "
+                    f"I now have {len(self.grammar.syntactic_patterns)} stored pattern(s).")
+
+        # ── 4. "Only in this context / in the context of X, Y means Z" ───
+        m = re.search(
+            r'(?:only\s+)?in\s+(?:this\s+context|the\s+context\s+of\s+\S+)[,\s]+'
+            r'["\']?(\w+)["\']?\s+means?\s+(.+)',
+            instruction, re.I)
+        if m:
+            word    = m.group(1).strip()
+            meaning = m.group(2).strip().rstrip('.')
+            self.semantic_net.add_concept(word.lower(), {'type': 'contextual', 'meaning': meaning})
+            self.learner.learn_qa(f"What does {word} mean?", f"In this context, {word} means {meaning}.", 'context_rule')
+            return f"Contextual rule saved: in this context, '{word}' means '{meaning}'."
+
+        # ── 5. Simple X = Y synonym / equivalence notation ───────────────
+        m = re.search(r'^(\w+)\s*=\s*([\w ]+)$', tl)
+        if m:
+            word    = m.group(1).strip()
+            synonym = m.group(2).strip()
+            self._register_synonym(word, synonym)
+            return (f"Got it! '{word}' and '{synonym}' are now synonyms. "
+                    f"I'll treat them the same way in future messages.")
+
+        # ── 6. "X, Y, Z belong to the same category" ─────────────────────
+        m = re.search(
+            r'(.+?)\s+belong\s+to\s+the\s+same\s+(?:category|group|class|type)',
+            instruction, re.I)
+        if m:
+            raw   = m.group(1)
+            words = [w.strip().strip('"\'') for w in re.split(r'[,;]+|\band\b', raw) if w.strip()]
+            for w in words:
+                self._register_synonym(w, words[0])   # anchor all to first word
+            self.learner.learn_qa(
+                f"What category do {', '.join(words)} belong to?",
+                f"'{', '.join(words)}' all belong to the same category and are treated the same way.",
+                'word_category')
+            return (f"Understood! I've grouped {words} into the same category. "
+                    f"They'll all be treated the same way from now on.")
+
+        # ── 7. "X and Y are [word class] / follow the same rules" ────────
+        m = re.search(
+            r'["\']?(\w+)["\']?\s+and\s+["\']?(\w+)["\']?\s+are\s+(\w+)s?'
+            r'(?:[,.]?\s*(?:they|treat them)\s+follow\s+the\s+same\s+rules?)?',
+            instruction, re.I)
+        if m:
+            w1, w2, cls = m.group(1), m.group(2), m.group(3).lower()
+            for w in [w1, w2]:
+                self.semantic_net.add_concept(w.lower(), {'type': cls, 'class': cls})
+                self.semantic_net.relate(w.lower(), 'same_class_as', cls, 0.9)
+            self.learner.learn_qa(
+                f"What class are {w1} and {w2}?",
+                f"Both '{w1}' and '{w2}' are {cls}s and follow the same grammatical rules.",
+                'word_class')
+            return (f"Understood! '{w1}' and '{w2}' are both {cls}s and follow the same rules. "
+                    f"I'll treat them the same way unless you tell me otherwise.")
+
+        # ── 8. "Treat X the same as Y" — supports multi-word phrases + short 'as' form ──
+        m = re.search(
+            r'(?:treat|use)\s+([\w\s]+?)\s+'
+            r'(?:the\s+same\s+(?:as|way\s+as?)|like|same\s+rules?\s+as|as)\s+([\w\s]+?)'
+            r'(?:\s*$|\s*[.!])',
+            instruction, re.I)
+        if m:
+            w_new = m.group(1).strip()
+            w_ref = m.group(2).strip()
+            self._register_synonym(w_new, w_ref)
+            return (f"Got it! '{w_new}' will be treated the same as '{w_ref}'. "
+                    f"I'll apply the same rules to both from now on.")
+
+        # ── 9. "Always replace / substitute X with Y" ────────────────────
+        m = re.search(
+            r'(?:always\s+)?(?:substitute|replace|change|swap|convert)\s+'
+            r'["\']?(\w+)["\']?\s+(?:to|into|with|for|→)\s+["\']?(\w+)["\']?',
+            instruction, re.I)
+        if m:
+            src, dst = m.group(1), m.group(2)
+            self.grammar.learn_pattern(f"substitution: {src} → {dst}", 'substitution')
+            self.learner.learn_qa(f"what replaces {src}?", f"Replace '{src}' with '{dst}'.", 'substitution_rule')
+            return f"Word rule learned: always replace '{src}' with '{dst}'."
+
+        # ── 10. "Use algorithm / pipeline X [but ignore Y]" ──────────────
+        m = re.search(
+            r"(?:use|apply|run)\s+(?:the\s+same\s+)?(?:algorithm|pipeline|method)?\s*"
+            r"(?:called\s+)?[\'\"]?(.+?)[\'\"]?\s*(?:but\s+(?:ignore|skip|without)\s+(.+))?$",
+            instruction, re.I)
+        if m and m.group(1).strip() not in ('', 'the', 'a', 'an'):
+            base   = m.group(1).strip()
+            ignore = m.group(2).strip() if m.group(2) else None
+            note   = f" but ignoring '{ignore}'" if ignore else ""
+            self.grammar.learn_pattern(f"algorithm: use {base}{note}", 'algorithm')
+            return f"Algorithm preference noted: use '{base}'{note}."
+
+        # ── Default fallback ──────────────────────────────────────────────
+        return ("I understand you want to teach me something — here's what I can learn:\n"
+                "- 'Add intent [name] with keywords [word1, word2]'\n"
+                "- 'When I ask about [topic], respond with [answer]'\n"
+                "- 'Learn pattern [sentence structure]'\n"
+                "- 'In this context, [word] means [meaning]'\n"
+                "- 'understanding = comprehension' (synonym notation)\n"
+                "- 'improve, enhance, boost belong to the same category'\n"
+                "- 'Treat [X] the same as [Y]'\n"
+                "- 'Always replace [X] with [Y]'")
+
+    def _register_synonym(self, word: str, synonym: str):
+        """Register two words/phrases as synonyms and dynamically extend improve_words."""
+        wl = word.lower().strip()
+        sl = synonym.lower().strip()
+        self.semantic_net.add_concept(wl, {'type': 'synonym', 'of': sl})
+        self.semantic_net.relate(wl, 'synonym_of', sl, 1.0)
+        self.semantic_net.relate(sl, 'synonym_of', wl, 1.0)
+        self.learner.learn_qa(f"What is a synonym of {word}?", f"'{synonym}' is a synonym of '{word}'.", 'synonym')
+        self.learner.learn_qa(f"What is a synonym of {synonym}?", f"'{word}' is a synonym of '{synonym}'.", 'synonym')
+
+
+
+# ── GUI ──
+class ModernTheme:
+    """Professional color scheme and styling"""
+    BG_PRIMARY = "#0f172a"          # Slate 900
+    BG_SECONDARY = "#1e293b"        # Slate 800
+    BG_TERTIARY = "#334155"         # Slate 700
+    ACCENT_PRIMARY = "#3b82f6"      # Blue 500
+    ACCENT_SECONDARY = "#8b5cf6"    # Violet 500
+    ACCENT_SUCCESS = "#10b981"      # Emerald 500
+    ACCENT_WARNING = "#f59e0b"      # Amber 500
+    TEXT_PRIMARY = "#f8fafc"        # Slate 50
+    TEXT_SECONDARY = "#94a3b8"      # Slate 400
+    TEXT_MUTED = "#64748b"          # Slate 500
+    BORDER = "#475569"              # Slate 600
+
+class ChatBubble(tk.Canvas):
+    """Custom chat bubble with modern styling"""
+    def __init__(self, parent, text, is_user=True, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.is_user = is_user
+        self.text = text
+
+        # Configure colors
+        if is_user:
+            self.bg_color = ModernTheme.ACCENT_PRIMARY
+            self.text_color = ModernTheme.TEXT_PRIMARY
+        else:
+            self.bg_color = ModernTheme.BG_TERTIARY
+            self.text_color = ModernTheme.TEXT_PRIMARY
+
+        self.configure(bg=ModernTheme.BG_SECONDARY, highlightthickness=0)
+        self.draw_bubble()
+
+    def draw_bubble(self):
+        """Draw rounded rectangle bubble with text"""
+        padding = 12
+        max_width = 400
+
+        # Calculate text dimensions
+        lines = self.text.split('\n')
+        text_width = min(max(len(line) for line in lines) * 7, max_width)
+        text_height = len(lines) * 20 + 10
+
+        # Create bubble
+        width = text_width + padding * 2
+        height = text_height + padding * 2
+
+        self.configure(width=width + 20, height=height)
+
+        # Draw rounded rectangle
+        radius = 15
+        x1, y1 = 10, 5
+        x2, y2 = width + 10, height + 5
+
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1
+        ]
+
+        self.create_polygon(points, smooth=True, fill=self.bg_color, outline="")
+
+        # Add text
+        self.create_text(width/2 + 10, height/2 + 5, text=self.text,
+                        fill=self.text_color, font=("Segoe UI", 10),
+                        width=max_width, justify="left")
+
+class TypingIndicator(tk.Frame):
+    """Animated typing indicator"""
+    def __init__(self, parent):
+        super().__init__(parent, bg=ModernTheme.BG_SECONDARY)
+        self.dots = []
+        for i in range(3):
+            dot = tk.Label(self, text="●", fg=ModernTheme.TEXT_MUTED,
+                          bg=ModernTheme.BG_SECONDARY, font=("Segoe UI", 8))
+            dot.pack(side="left", padx=2)
+            self.dots.append(dot)
+        self.animating = False
+        self.current = 0
+
+    def start(self):
+        self.animating = True
+        self.animate()
+
+    def stop(self):
+        self.animating = False
+        for dot in self.dots:
+            dot.config(fg=ModernTheme.TEXT_MUTED)
+
+    def animate(self):
+        if not self.animating:
+            return
+
+        for i, dot in enumerate(self.dots):
+            if i == self.current:
+                dot.config(fg=ModernTheme.ACCENT_PRIMARY)
+            else:
+                dot.config(fg=ModernTheme.TEXT_MUTED)
+
+        self.current = (self.current + 1) % 3
+        self.after(300, self.animate)
+
+class KnowledgePanel(tk.Frame):
+    """Real-time knowledge base visualization"""
+    def __init__(self, parent, engine):
+        super().__init__(parent, bg=ModernTheme.BG_SECONDARY)
+        self.engine = engine
+
+        # Header
+        header = tk.Label(self, text="🧠 Knowledge Base", 
+                         font=("Segoe UI", 12, "bold"),
+                         bg=ModernTheme.BG_SECONDARY, fg=ModernTheme.TEXT_PRIMARY)
+        header.pack(pady=10)
+
+        # Stats frame
+        stats_frame = tk.Frame(self, bg=ModernTheme.BG_TERTIARY, padx=10, pady=10)
+        stats_frame.pack(fill="x", padx=10, pady=5)
+
+        self.stats_labels = {}
+        stats = [
+            ("Concepts", len(engine.semantic_net.concepts)),
+            ("Q&A Pairs", len(engine.learner.qa_pairs)),
+            ("Conversations", len(engine.learner.conversations)),
+            ("Grammar Rules", len(engine.grammar.rules))
+        ]
+
+        for i, (label, value) in enumerate(stats):
+            tk.Label(stats_frame, text=label, font=("Segoe UI", 9),
+                    bg=ModernTheme.BG_TERTIARY, fg=ModernTheme.TEXT_SECONDARY).grid(row=i, column=0, sticky="w", pady=2)
+            self.stats_labels[label] = tk.Label(stats_frame, text=str(value),
+                                               font=("Segoe UI", 9, "bold"),
+                                               bg=ModernTheme.BG_TERTIARY, 
+                                               fg=ModernTheme.ACCENT_PRIMARY)
+            self.stats_labels[label].grid(row=i, column=1, sticky="e", padx=10)
+
+        # Current topic
+        self.topic_label = tk.Label(self, text="Current Topic: None",
+                                   font=("Segoe UI", 10, "italic"),
+                                   bg=ModernTheme.BG_SECONDARY, 
+                                   fg=ModernTheme.ACCENT_SECONDARY)
+        self.topic_label.pack(pady=10)
+
+        # Recent learned items
+        tk.Label(self, text="Recent Learning", font=("Segoe UI", 10, "bold"),
+                bg=ModernTheme.BG_SECONDARY, fg=ModernTheme.TEXT_PRIMARY).pack(pady=5)
+
+        self.learning_text = scrolledtext.ScrolledText(self, height=8, wrap=tk.WORD,
+                                                      bg=ModernTheme.BG_TERTIARY,
+                                                      fg=ModernTheme.TEXT_SECONDARY,
+                                                      font=("Consolas", 9),
+                                                      padx=5, pady=5)
+        self.learning_text.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.update_stats()
+
+    def update_stats(self):
+        """Refresh statistics display"""
+        self.stats_labels["Concepts"].config(text=str(len(self.engine.semantic_net.concepts)))
+        self.stats_labels["Q&A Pairs"].config(text=str(len(self.engine.learner.qa_pairs)))
+        self.stats_labels["Conversations"].config(text=str(len(self.engine.learner.conversations)))
+
+        topic = self.engine.current_topic or "General"
+        self.topic_label.config(text=f"Current Topic: {topic.title()}")
+
+        # Update recent learning
+        self.learning_text.delete(1.0, tk.END)
+        recent = self.engine.learner.conversations[-5:] if self.engine.learner.conversations else []
+        for item in recent:
+            timestamp = item.get('timestamp', 'Unknown')[:10]
+            intent = item.get('intent', 'unknown')
+            self.learning_text.insert(tk.END, f"[{timestamp}] {intent}\n")
+
+        self.after(2000, self.update_stats)
+
+class NLPChatbotGUI:
+    """Main application window"""
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Neural-Symbolic AI Assistant - Zero Dependencies")
+        self.root.geometry("1200x800")
+        self.root.configure(bg=ModernTheme.BG_PRIMARY)
+
+        # Initialize engine
+        self.engine = NLPEngine()
+        self.message_queue = queue.Queue()
+
+        self.setup_styles()
+        self.create_widgets()
+        self.start_processing_thread()
+
+        # Welcome message
+        self.add_bot_message("Hello! I'm an advanced rule-based NLP system with zero external dependencies.\n\nI can:\n• Answer questions using learned knowledge\n• Summarize and rephrase text\n• Learn from our conversations\n• Update my behavior via natural language instructions\n\nTry asking me something or say 'help' for commands.")
+
+    def setup_styles(self):
+        """Configure ttk styles"""
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        style.configure("Custom.TFrame", background=ModernTheme.BG_SECONDARY)
+        style.configure("Custom.TButton", 
+                       background=ModernTheme.ACCENT_PRIMARY,
+                       foreground=ModernTheme.TEXT_PRIMARY,
+                       font=("Segoe UI", 10, "bold"),
+                       padding=10)
+        style.map("Custom.TButton",
+                 background=[('active', ModernTheme.ACCENT_SECONDARY)])
+
+    def create_widgets(self):
+        """Create main UI components"""
+        # Main container
+        main_container = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, 
+                                       bg=ModernTheme.BORDER)
+        main_container.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Left panel - Chat
+        left_frame = tk.Frame(main_container, bg=ModernTheme.BG_SECONDARY)
+        main_container.add(left_frame, width=800)
+
+        # Header
+        header = tk.Frame(left_frame, bg=ModernTheme.BG_PRIMARY, height=60)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        tk.Label(header, text="🤖 Neural-Symbolic Assistant (Pure Python)", 
+                font=("Segoe UI", 16, "bold"),
+                bg=ModernTheme.BG_PRIMARY, fg=ModernTheme.TEXT_PRIMARY).pack(side="left", padx=20, pady=10)
+
+        # Status indicator
+        self.status_label = tk.Label(header, text="● Online", 
+                                    font=("Segoe UI", 10),
+                                    bg=ModernTheme.BG_PRIMARY, 
+                                    fg=ModernTheme.ACCENT_SUCCESS)
+        self.status_label.pack(side="right", padx=20)
+
+        # Chat display area
+        chat_container = tk.Frame(left_frame, bg=ModernTheme.BG_SECONDARY)
+        chat_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Canvas with scrollbar for chat bubbles
+        self.chat_canvas = tk.Canvas(chat_container, bg=ModernTheme.BG_SECONDARY,
+                                    highlightthickness=0)
+        scrollbar = ttk.Scrollbar(chat_container, orient="vertical", 
+                                 command=self.chat_canvas.yview)
+
+        self.chat_frame = tk.Frame(self.chat_canvas, bg=ModernTheme.BG_SECONDARY)
+        self.chat_canvas.create_window((0, 0), window=self.chat_frame, anchor="nw", width=780)
+
+        self.chat_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self.chat_canvas.pack(side="left", fill="both", expand=True)
+
+        self.chat_frame.bind("<Configure>", lambda e: self.chat_canvas.configure(
+            scrollregion=self.chat_canvas.bbox("all")))
+
+        # Typing indicator (initially hidden)
+        self.typing_indicator = TypingIndicator(left_frame)
+
+        # Input area
+        input_frame = tk.Frame(left_frame, bg=ModernTheme.BG_TERTIARY, padx=10, pady=10)
+        input_frame.pack(fill="x", side="bottom")
+
+        self.input_field = tk.Entry(input_frame, font=("Segoe UI", 11),
+                                   bg=ModernTheme.BG_SECONDARY,
+                                   fg=ModernTheme.TEXT_PRIMARY,
+                                   insertbackground=ModernTheme.TEXT_PRIMARY,
+                                   relief="flat")
+        self.input_field.pack(side="left", fill="x", expand=True, padx=(0, 10), ipady=8)
+        self.input_field.bind("<Return>", lambda e: self.send_message())
+
+        send_btn = tk.Button(input_frame, text="Send ➤", 
+                            font=("Segoe UI", 10, "bold"),
+                            bg=ModernTheme.ACCENT_PRIMARY,
+                            fg=ModernTheme.TEXT_PRIMARY,
+                            activebackground=ModernTheme.ACCENT_SECONDARY,
+                            activeforeground=ModernTheme.TEXT_PRIMARY,
+                            relief="flat", cursor="hand2",
+                            command=self.send_message)
+        send_btn.pack(side="right", ipadx=15, ipady=5)
+
+        # Right panel - Knowledge & Controls
+        right_frame = tk.Frame(main_container, bg=ModernTheme.BG_SECONDARY, width=350)
+        main_container.add(right_frame)
+
+        # Knowledge panel
+        self.knowledge_panel = KnowledgePanel(right_frame, self.engine)
+        self.knowledge_panel.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Control buttons
+        control_frame = tk.Frame(right_frame, bg=ModernTheme.BG_TERTIARY, padx=10, pady=10)
+        control_frame.pack(fill="x", side="bottom")
+
+        tk.Button(control_frame, text="📁 Load Data File", 
+                 command=self.load_data_file,
+                 bg=ModernTheme.ACCENT_SECONDARY,
+                 fg=ModernTheme.TEXT_PRIMARY,
+                 font=("Segoe UI", 9),
+                 relief="flat").pack(fill="x", pady=2)
+
+        tk.Button(control_frame, text="💾 Save Knowledge", 
+                 command=self.save_knowledge,
+                 bg=ModernTheme.ACCENT_SUCCESS,
+                 fg=ModernTheme.TEXT_PRIMARY,
+                 font=("Segoe UI", 9),
+                 relief="flat").pack(fill="x", pady=2)
+
+        tk.Button(control_frame, text="🧹 Clear Chat", 
+                 command=self.clear_chat,
+                 bg=ModernTheme.BG_SECONDARY,
+                 fg=ModernTheme.TEXT_PRIMARY,
+                 font=("Segoe UI", 9),
+                 relief="flat").pack(fill="x", pady=2)
+
+        # Quick actions
+        quick_frame = tk.LabelFrame(right_frame, text="Quick Actions", 
+                                   bg=ModernTheme.BG_SECONDARY,
+                                   fg=ModernTheme.TEXT_SECONDARY,
+                                   font=("Segoe UI", 10))
+        quick_frame.pack(fill="x", padx=10, pady=5)
+
+        actions = [
+            ("Summarize text", "Summarize: [paste text]"),
+            ("Rephrase", "Rephrase this: [text]"),
+            ("Explain", "Explain how reasoning works"),
+            ("Learn", "Learn that [fact]"),
+            ("Update", "Add intent greeting with keywords hello, hi")
+        ]
+
+        for label, command in actions:
+            btn = tk.Button(quick_frame, text=label,
+                          command=lambda c=command: self.set_input(c),
+                          bg=ModernTheme.BG_TERTIARY,
+                          fg=ModernTheme.TEXT_PRIMARY,
+                          relief="flat", font=("Segoe UI", 9))
+            btn.pack(fill="x", pady=1)
+
+    def add_user_message(self, text):
+        """Add user message bubble"""
+        frame = tk.Frame(self.chat_frame, bg=ModernTheme.BG_SECONDARY)
+        frame.pack(fill="x", pady=5, padx=10)
+
+        # Timestamp
+        time_label = tk.Label(frame, text=datetime.now().strftime("%H:%M"),
+                             font=("Segoe UI", 8),
+                             bg=ModernTheme.BG_SECONDARY, fg=ModernTheme.TEXT_MUTED)
+        time_label.pack(side="right", padx=5)
+
+        # Bubble
+        bubble = ChatBubble(frame, text, is_user=True, 
+                           bg=ModernTheme.BG_SECONDARY, height=40)
+        bubble.pack(side="right")
+
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def add_bot_message(self, text):
+        """Add bot message bubble"""
+        frame = tk.Frame(self.chat_frame, bg=ModernTheme.BG_SECONDARY)
+        frame.pack(fill="x", pady=5, padx=10)
+
+        # Avatar
+        avatar = tk.Label(frame, text="🤖", font=("Segoe UI", 16),
+                         bg=ModernTheme.BG_SECONDARY)
+        avatar.pack(side="left", padx=(0, 5))
+
+        # Bubble
+        bubble = ChatBubble(frame, text, is_user=False,
+                           bg=ModernTheme.BG_SECONDARY, height=40)
+        bubble.pack(side="left")
+
+        # Timestamp
+        time_label = tk.Label(frame, text=datetime.now().strftime("%H:%M"),
+                             font=("Segoe UI", 8),
+                             bg=ModernTheme.BG_SECONDARY, fg=ModernTheme.TEXT_MUTED)
+        time_label.pack(side="left", padx=5)
+
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def send_message(self):
+        """Handle message sending"""
+        text = self.input_field.get().strip()
+        if not text:
+            return
+
+        self.input_field.delete(0, tk.END)
+        self.add_user_message(text)
+
+        # Show typing indicator
+        self.typing_indicator.pack(fill="x", padx=20, pady=5)
+        self.typing_indicator.start()
+
+        # Queue for processing
+        self.message_queue.put(text)
+
+    def process_message(self, text):
+        """Process message in background thread"""
+        try:
+            # Check for instruction
+            if any(keyword in text.lower() for keyword in ['add intent', 'when i ask', 'learn pattern', 'update']):
+                response = self.engine.learn_instruction(text)
+            else:
+                # Normal processing
+                analysis = self.engine.process(text)
+                response = self.engine.generate_response(analysis)
+
+            # Schedule UI update
+            self.root.after(0, lambda: self.display_response(response))
+        except Exception as e:
+            self.root.after(0, lambda: self.display_response(f"Error processing: {str(e)}"))
+
+    def display_response(self, response):
+        """Display bot response"""
+        self.typing_indicator.stop()
+        self.typing_indicator.pack_forget()
+        self.add_bot_message(response)
+
+    def start_processing_thread(self):
+        """Start background processing"""
+        def worker():
+            while True:
+                try:
+                    text = self.message_queue.get(timeout=1)
+                    self.process_message(text)
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Worker error: {e}")
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def load_data_file(self):
+        """Load knowledge from file"""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if filepath:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                self.engine._process_data_file(content, os.path.basename(filepath))
+                self.add_bot_message(f"✓ Loaded knowledge from {os.path.basename(filepath)}. Extracted Q&A pairs and semantic relationships.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load file: {str(e)}")
+
+    def save_knowledge(self):
+        """Save current knowledge"""
+        self.engine.learner.save_knowledge()
+        self.add_bot_message("✓ Knowledge base saved successfully. All learned patterns, Q&A pairs, and conversation history persisted.")
+
+    def clear_chat(self):
+        """Clear chat display"""
+        for widget in self.chat_frame.winfo_children():
+            widget.destroy()
+        self.add_bot_message("Chat history cleared. How can I help you?")
+
+    def set_input(self, text):
+        """Set input field text"""
+        self.input_field.delete(0, tk.END)
+        self.input_field.insert(0, text)
+        self.input_field.focus()
+
+    def run(self):
+        """Start application"""
+        self.root.mainloop()
+
+def cli_mode():
+    engine = NLPEngine()
+    print("Bot: Hello! Ready to chat. Type 'exit' to quit.")
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+            if user_input.lower() in ['exit','quit','bye']:
+                engine.learner.save_knowledge(); break
+            if not user_input: continue
+            analysis = engine.process(user_input)
+            response = engine.generate_response(analysis)
+            print(f"Bot: {response}")
+        except KeyboardInterrupt:
+            engine.learner.save_knowledge(); break
+        except Exception as e:
+            print(f"Bot: Error: {e}")
+
+if __name__ == "__main__":
+    print("🧠 Neural-Symbolic NLP Chatbot (FIXED)")
+    print("\n5 CRITICAL BUGS FIXED:")
+    print("1. Removed duplicate SentenceParser class")
+    print("2. Moved tkinter imports to top (fixes NameError)")
+    print("3. Fixed SentenceParser.answer() premature None returns")
+    print("4. Improved context sentence storage in _handle_statement")
+    print("5. Fixed question matching logic (less aggressive stopwords)")
+    print("\nStarting...")
+
+    if TKINTER_AVAILABLE:
+        try:
+            app = NLPChatbotGUI()
+            app.run()
+        except Exception as e:
+            print(f"GUI error: {e}")
+            print("Falling back to CLI mode...")
+            cli_mode()
+    else:
+        print("Tkinter not available — using CLI mode")
+        cli_mode()
